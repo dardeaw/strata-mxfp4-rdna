@@ -1,4 +1,5 @@
 #include "strata/core/native_dense.hpp"
+#include "strata/core/geometry.hpp"
 #include <cstdlib>
 #include "strata/core/weights.hpp"
 #include "strata/artifact/gguf_reader.hpp"
@@ -154,6 +155,9 @@ std::vector<uint8_t> q8_0_of_bf16(const uint16_t* x, uint64_t n) {
 bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     const auto& name = tensor.name;
     if (name.rfind("blk.", 0) != 0) return false;
+    // The trunk's dense projections only: an in-file MTP block (the tsaipifong GGUFs' blk.48, block_count 49 with
+    // nextn_predict_layers 1) is not one of them, and the canonical table has no entry to map it to.
+    if (std::strtol(name.c_str() + 4, nullptr, 10) >= (long) strata::core::kCompiledGeometry.n_layers) return false;
     // Match the native PLE kernel: Q2_0, IQ3_XXS, IQ4_XS and Q8_0 (UD-Q4_K_XL). Other keys retain the packed BF16
     // fallback.
     if (name == "blk.1.ple_key.weight")

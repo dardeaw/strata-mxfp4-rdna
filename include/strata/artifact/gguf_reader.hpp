@@ -729,6 +729,18 @@ inline std::string read_geometry(const GgufFile& f, core::ModelGeometry& g) {
     for (const Key& k : keys)
         if (!read_int(k.key, g.*k.field, k.required)) return err;
 
+    // In-file MTP (qwen4exp.nextn_predict_layers): the MTP head is the block(s) past the main stack.  The
+    // compiled geometry is the main stack, and a model whose block_count includes the MTP head (the
+    // tsaipifong MXFP4 GGUFs: 49 = 48 + 1) must be read as its 48 main layers; the MTP block is not part of it.
+    int64_t nextn = 0;
+    if (const MetaValue* v = f.get(p + "nextn_predict_layers")) {
+        if (!v->is_num()) return p + "nextn_predict_layers is not a number";
+        nextn = (int64_t) v->u;
+        if (nextn < 0) return p + "nextn_predict_layers is negative";
+    }
+    if (nextn > 0 && g.n_layers == core::kCompiledGeometry.n_layers + nextn)
+        g.n_layers = core::kCompiledGeometry.n_layers;
+
     int64_t value_length = g.head_dim, ff_shexp = g.n_ff;
     if (!read_int("attention.value_length", value_length, false) ||
         !read_int("expert_shared_feed_forward_length", ff_shexp, false))
@@ -766,9 +778,12 @@ inline std::string read_geometry(const GgufFile& f, core::ModelGeometry& g) {
     // The layer split, twice over: the interval, and a ratio per layer that is non-zero (the indexer's pooling
     // block) exactly on the full-attention layers.
     if (const MetaValue* v = f.get(p + "attention.compress_ratios")) {
-        if (v->type != MetaType::ARRAY || v->count != (uint64_t) g.n_layers || v->items.size() != v->count)
+        const uint64_t main_count = (uint64_t) g.n_layers;
+        const uint64_t with_mtp = main_count + (uint64_t) nextn;
+        if (v->type != MetaType::ARRAY || (v->count != main_count && v->count != with_mtp) ||
+            v->items.size() != v->count)
             return p + "attention.compress_ratios must list one entry for each of the " + std::to_string(g.n_layers) +
-                   " layers";
+                   " layers (plus the MTP heads)";
         // A list of zeros only is a converter's placeholder, not a layer split (#2396: orcarouter's
         // Qwen3.8-Flash-Next-Uncensored GGUFs carry 48 zeros; 0.1.43 never read the key): it is treated as absent
         // and the compiled pooling block is used.  A list with any non-zero entry is checked in full below.
