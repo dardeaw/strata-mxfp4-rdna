@@ -5483,6 +5483,116 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
     check("iq_dequant_gu_f16");
 }
 
+// ---- MXFP4 -> FP8 E4M3 (STRATA_MXFP4_FP8): vLLM's Quark W4A8 compute model.  QuarkW4A8Fp8MoEMethod dequantizes
+// MXFP4 experts with their per-32 E8M0 scale and runs the products in FP8 E4M3 (AITER moe_gemm_a8w4 / scaled_mm).
+// An E2M1 value times a power of two is an E4M3 value (<= 4 significant bits, within range), so the weight
+// dequantization is exact; the activations take vLLM's dynamic per-token E4M3 quantization.
+__device__ __forceinline__ uint8_t f32_to_e4m3(float v) {
+    const uint32_t u = __float_as_uint(v);
+    const uint8_t sign = (uint8_t) ((u >> 24) & 0x80u);
+    const float a = fabsf(v);
+    if (a != a) return (uint8_t) (sign | 0x7Fu);          // NaN
+    if (a >= 448.0f) return (uint8_t) (sign | 0x7Eu);     // OCP E4M3 has no inf: saturate
+    if (a < (1.0f / 1024.0f)) return sign;                // below half the smallest subnormal
+    int e = 0;
+    const float m = frexpf(a, &e);                        // a = m * 2^e, m in [0.5, 1)
+    int ex = e - 1;                                       // value = 1.mmm * 2^ex
+    int mant = __float2int_rn((m * 2.0f - 1.0f) * 8.0f);
+    if (mant == 8) { mant = 0; ++ex; }
+    if (ex >= -6) {                                       // normal (or the max normal)
+        if (ex > 8 || (ex == 8 && mant > 6)) return (uint8_t) (sign | 0x7Eu);
+        return (uint8_t) (sign | ((ex + 7) << 3) | mant);
+    }
+    const int sub = __float2int_rn(a * 512.0f);           // subnormal, 2^-9 units
+    if (sub >= 8) return (uint8_t) (sign | 0x08u);
+    return (uint8_t) (sign | sub);
+}
+
+// 256 values (8 MXFP4 blocks) per block, 32 threads: thread tid owns block tid%8, quarter tid/8.
+__global__ void dequant_mxfp4_fp8_kernel(const void* __restrict__ vx, uint8_t* __restrict__ y) {
+    const int64_t i = blockIdx.x;
+    const block_mxfp4* x = (const block_mxfp4*) vx + i * (QK_K / QK_MXFP4);
+    const int ib = threadIdx.x % 8, il = threadIdx.x / 8;
+    const float d = e8m0_to_fp32_half(x[ib].e);
+    uint8_t* o = y + i * QK_K + 32 * ib;
+    for (int j = 0; j < 4; ++j) {
+        const int iqs = 4 * il + j;
+        o[iqs] = f32_to_e4m3(d * kvalues_mxfp4[x[ib].qs[iqs] & 0xf]);
+        o[iqs + 16] = f32_to_e4m3(d * kvalues_mxfp4[x[ib].qs[iqs] >> 4]);
+    }
+}
+
+// gate/up: superblock i of a role matrix (n_embd/256 per row) -> interleaved row 2r + parity, the layout
+// iq_dequant_gu_f16 writes and swiglu_interleaved reads.
+__global__ void dequant_gu_mxfp4_fp8_kernel(const void* __restrict__ gate, const void* __restrict__ up, int64_t per_row,
+                                            uint8_t* __restrict__ y) {
+    const int64_t i = blockIdx.x;
+    const int parity = blockIdx.y;
+    const int64_t r = i / per_row, c = i % per_row;
+    uint8_t* o = y + ((2 * r + parity) * per_row + c) * QK_K;
+    const block_mxfp4* x = (const block_mxfp4*) (parity ? up : gate) + i * (QK_K / QK_MXFP4);
+    const int ib = threadIdx.x % 8, il = threadIdx.x / 8;
+    const float d = e8m0_to_fp32_half(x[ib].e);
+    o += 32 * ib;
+    for (int j = 0; j < 4; ++j) {
+        const int iqs = 4 * il + j;
+        o[iqs] = f32_to_e4m3(d * kvalues_mxfp4[x[ib].qs[iqs] & 0xf]);
+        o[iqs + 16] = f32_to_e4m3(d * kvalues_mxfp4[x[ib].qs[iqs] >> 4]);
+    }
+}
+
+// One block per row: dynamic per-row E4M3 quantization (vLLM's per-token FP8 activation).  `scale[r]` is what the
+// GEMM's epilogue multiplies back in.
+__global__ void quantize_fp8_rows_kernel(const __half* __restrict__ x, int64_t cols, uint8_t* __restrict__ y,
+                                         float* __restrict__ scale) {
+    const int64_t r = blockIdx.x;
+    const __half* xr = x + r * cols;
+    uint8_t* yr = y + r * cols;
+    __shared__ float red[256];
+    float m = 0.0f;
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) m = fmaxf(m, fabsf(__half2float(xr[i])));
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const float sc = red[0] > 0.0f ? red[0] / 448.0f : 1.0f;
+        scale[r] = sc;
+        red[0] = 1.0f / sc;
+    }
+    __syncthreads();
+    const float inv = red[0];
+    for (int i = threadIdx.x; i < cols; i += blockDim.x) yr[i] = f32_to_e4m3(__half2float(xr[i]) * inv);
+}
+
+void iq_dequant_mxfp4_fp8(int t, const void* src, int64_t n, uint8_t* dst, void* stream) {
+    if (t != 39 || n % 256 != 0) {
+        std::fprintf(stderr, "iq_dequant_mxfp4_fp8: type %d / %lld\n", t, (long long) n);
+        std::exit(1);
+    }
+    dequant_mxfp4_fp8_kernel<<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(src, dst);
+    check("iq_dequant_mxfp4_fp8");
+}
+
+void iq_dequant_gu_mxfp4_fp8(int t, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint8_t* dst,
+                             void* stream) {
+    if (t != 39 || n_embd % 256 != 0) {
+        std::fprintf(stderr, "iq_dequant_gu_mxfp4_fp8: type %d / %lld\n", t, (long long) n_embd);
+        std::exit(1);
+    }
+    const int64_t per_row = n_embd / 256;
+    dequant_gu_mxfp4_fp8_kernel<<<dim3((unsigned) (n_ff * per_row), 2), 32, 0, (cudaStream_t) stream>>>(gate, up, per_row, dst);
+    check("iq_dequant_gu_mxfp4_fp8");
+}
+
+void quantize_fp8_rows(const void* x, int64_t rows, int64_t cols, uint8_t* y, float* scale, void* stream) {
+    if (rows <= 0 || cols <= 0) return;
+    quantize_fp8_rows_kernel<<<(unsigned) rows, 256, 0, (cudaStream_t) stream>>>((const __half*) x, cols, y, scale);
+    check("quantize_fp8_rows");
+}
+
 // A bad block is a pack or caller error (expert_layout_load already refuses a block that does not divide the expert
 // widths): it exits with a message, like check() does for a failed launch.
 namespace {

@@ -15,6 +15,7 @@
 #endif
 #include "mmq_resident_sort.hpp"
 #include "wmma_gemm.h"
+#include "strata/prefill/fp8_gemm.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/pinned_ring.hpp"
 #include "strata/core/progress.hpp"
@@ -1158,6 +1159,10 @@ struct Prefill::Impl {
     size_t grp_n = 0, grp_tk = 0;        // int32s allocated; T_max * K (the offset of slot, and of src past it)
     uint16_t* dq_gu[DQ] = {};
     uint16_t* dq_d[DQ] = {};
+    uint8_t* x8 = nullptr;      // STRATA_MXFP4_FP8: the chunk's E4M3 activations and H, with a scale per row
+    uint8_t* h8 = nullptr;
+    float* x8s = nullptr;
+    float* h8s = nullptr;
     uint8_t* stage_dev[RING_MAX] = {};
     int ring = STAGE;                        // the slots of this layout's ring (ring_slots)
     // THE PROMPT ROOM's resolved counts for this layout (carve): the rule's ring, the room's first slot (past the
@@ -1442,6 +1447,17 @@ bool pf_wmma() {
     return on;
 #endif
 }
+// STRATA_MXFP4_FP8=1: MXFP4 experts take the FP8 prompt path (vLLM's Quark W4A8 compute model).  The E2M1 weights
+// are dequantized to E4M3 with their per-32 E8M0 scale (exact: a power of two times <= 4 significant bits) and the
+// activations are quantized per row to E4M3, so the expert products run on gfx12's FP8 WMMA.
+bool mx_fp8_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_MXFP4_FP8");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+
 const MmqPlan& mmq_plan() {
     static const MmqPlan plan = [] {
         MmqPlan p;
@@ -2000,6 +2016,12 @@ bool Prefill::carve(size_t T, void* alloc) {
         if (base == nullptr) ok = false;
     }
     for (int i = 0; i < DQ; ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640, ok); }
+    if (mx_fp8_on()) {   // the FP8 prompt path: T*N and T*640 bytes, and a scale per row
+        m.x8 = o.take<uint8_t>((size_t) T * N, ok);
+        m.h8 = o.take<uint8_t>((size_t) T * 640, ok);
+        m.x8s = o.take<float>((size_t) T, ok);
+        m.h8s = o.take<float>((size_t) T, ok);
+    }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         m.ids_identity = o.take<int32_t>(T * K, ok);
@@ -2793,6 +2815,9 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
                                        moe_set_bytes(T, g.n_expert, fused_layout(T, src)),
                                        hcr ? hc_set_bytes(T, f16_io) : (uint64_t) 0}), ok);
     for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
+    if (mx_fp8_on()) {   // STRATA_MXFP4_FP8: the FP8 activations, H and their per-row scales
+        o.take<uint8_t>(T * N, ok); o.take<uint8_t>(T * 640, ok); o.take<float>(T, ok); o.take<float>(T, ok);
+    }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         o.take<int32_t>(T * K, ok);
@@ -5767,21 +5792,42 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 return true;
                             }
                             const int q = (int) (j % DQ);
+                            const bool fp8 = lay.native && mx_fp8_on() && lay.fmt[(size_t) l].gu_type == 39 &&
+                                             lay.fmt[(size_t) l].d_type == 39 && lay.fmt[(size_t) l].tail_off == 0 &&
+                                             m.x8 != nullptr && m.h8 != nullptr && m.x8s != nullptr && m.h8s != nullptr;
                             if (lay.native) {
                                 // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
                                 const auto& f = lay.fmt[(size_t) l];
-                                strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
-                                                                   m.dq_gu[q], m.cs,
-                                                                   f.tail_off ? (const float*) (blob_dev + f.tail_off) : nullptr);
-                                strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs,
-                                                                f.tail_off ? (const float*) (blob_dev + f.tail_off) + 2 : nullptr);
+                                if (fp8) {
+                                    // vLLM's W4A8 compute model: MXFP4 -> FP8 E4M3 (the E8M0 scale folded in), the
+                                    // activations quantized per row below, the products on gfx12's FP8 WMMA
+                                    strata::kernels::iq_dequant_gu_mxfp4_fp8(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff,
+                                                                             f.n_embd, (uint8_t*) m.dq_gu[q], m.cs);
+                                    strata::kernels::iq_dequant_mxfp4_fp8(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff,
+                                                                          (uint8_t*) m.dq_d[q], m.cs);
+                                } else {
+                                    strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
+                                                                       m.dq_gu[q], m.cs,
+                                                                       f.tail_off ? (const float*) (blob_dev + f.tail_off) : nullptr);
+                                    strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs,
+                                                                    f.tail_off ? (const float*) (blob_dev + f.tail_off) + 2 : nullptr);
+                                }
                             } else {
                                 blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
                             }
                             if (slot >= 0) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
                             const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
                             pt.mark(kPfGemmGU, cs);
-                            m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N);
+                            if (fp8) {
+                                strata::kernels::quantize_fp8_rows(m.Xs + o0 * N, ne, N, m.x8, m.x8s + o0, m.cs);
+                                if (!strata::prefill::fp8_gemm(m.x8, (const uint8_t*) m.dq_gu[q], m.GU + o0 * 1280, ne, 1280,
+                                                               N, 1280, m.x8s + o0, m.cs)) {
+                                    err = "prefill: the MXFP4 FP8 gate/up GEMM did not launch";
+                                    return false;
+                                }
+                            } else {
+                                m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N);
+                            }
                             swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
                             // APR, deliberately in place on the fp16 H: hadamard_rows_f16 reads fp16, runs the
                             // butterflies in fp32 and rounds once on the store, so against an fp32 rotation the only
@@ -5793,7 +5839,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             // gate/up input (Xs above) is handled the same way.
                             if (had_d) strata::kernels::hadamard_rows_f16(m.Hh + o0 * 640, ne, 640, had_block, had_sh, m.cs);
                             pt.mark(kPfGemmD, cs);
-                            m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
+                            if (fp8) {
+                                strata::kernels::quantize_fp8_rows(m.Hh + o0 * 640, ne, 640, m.h8, m.h8s + o0, m.cs);
+                                if (!strata::prefill::fp8_gemm(m.h8, (const uint8_t*) m.dq_d[q], m.Dm + o0 * N, ne, N, 640,
+                                                               N, m.h8s + o0, m.cs)) {
+                                    err = "prefill: the MXFP4 FP8 down GEMM did not launch";
+                                    return false;
+                                }
+                            } else {
+                                m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
+                            }
                             return true;
                         };
                         if (ws_layer) {
@@ -6977,6 +7032,10 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
         // per super-chunk, then per entry its rows' FP16 inputs (lb.mixed_h, the bits run_impl's gather reads) through
         // two FP16 GEMMs into the group's Dm rows; the group's rows are added per token as on the MMQ path
         const bool fp16_l = !mmq_plan().layer[(size_t) l];
+        // STRATA_MXFP4_FP8: the same FP16 path, with MXFP4 dequantized to E4M3 and the products on FP8 WMMA
+        const bool fp8 = fp16_l && lay.native && lay.fmt[(size_t) l].gu_type == 39 &&
+                         lay.fmt[(size_t) l].d_type == 39 && lay.fmt[(size_t) l].tail_off == 0 &&
+                         m.x8 != nullptr && m.h8 != nullptr && m.x8s != nullptr && m.h8s != nullptr;
         const size_t mmq_gub = fp16_l ? 0 : mmq::matrix_bytes(mmq_gt, 1280, N), mmq_db = fp16_l ? 0 : mmq::matrix_bytes(mmq_dt, N, 640);
         size_t staged = 0, u = 0;
         const uint8_t* blob_dev = nullptr;
@@ -7008,10 +7067,17 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                     dq = (dq + 1) % DQ;
                     if (lay.native) {
                         const auto& f = lay.fmt[(size_t) l];
-                        strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
-                                                           m.dq_gu[dq], cs, nullptr);
-                        strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[dq], cs,
-                                                        nullptr);
+                        if (fp8) {
+                            strata::kernels::iq_dequant_gu_mxfp4_fp8(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff,
+                                                                     f.n_embd, (uint8_t*) m.dq_gu[dq], cs);
+                            strata::kernels::iq_dequant_mxfp4_fp8(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff,
+                                                                  (uint8_t*) m.dq_d[dq], cs);
+                        } else {
+                            strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
+                                                               m.dq_gu[dq], cs, nullptr);
+                            strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[dq], cs,
+                                                            nullptr);
+                        }
                     } else {
                         blob_dequant_f16(blob_dev, m.dq_gu[dq], m.dq_d[dq], cs);
                     }
@@ -7024,10 +7090,28 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                 const int64_t o = ents[j].r0 - gp.r0, nr = ents[j].nr;
                 gather_rows16(lb.mixed_h, d_row_tok + ents[j].r0, m.Xs + o * N, nr, N, cs);
                 pt.mark(kPfGemmGU, cs);
-                m.gemm.f16(m.Xs + o * N, m.dq_gu[dq], m.GU + o * 1280, nr, 1280, N);
+                if (fp8) {
+                    strata::kernels::quantize_fp8_rows(m.Xs + o * N, nr, N, m.x8, m.x8s, cs);
+                    if (!strata::prefill::fp8_gemm(m.x8, (const uint8_t*) m.dq_gu[dq], m.GU + o * 1280, nr, 1280, N,
+                                                   1280, m.x8s, cs)) {
+                        err = "prefill: the MXFP4 FP8 gate/up GEMM did not launch";
+                        return false;
+                    }
+                } else {
+                    m.gemm.f16(m.Xs + o * N, m.dq_gu[dq], m.GU + o * 1280, nr, 1280, N);
+                }
                 swiglu_interleaved(m.GU + o * 1280, m.Hh + o * 640, nr, cs);
                 pt.mark(kPfGemmD, cs);
-                m.gemm.f16(m.Hh + o * 640, m.dq_d[dq], m.Dm + o * N, nr, N, 640);
+                if (fp8) {
+                    strata::kernels::quantize_fp8_rows(m.Hh + o * 640, nr, 640, m.h8, m.h8s, cs);
+                    if (!strata::prefill::fp8_gemm(m.h8, (const uint8_t*) m.dq_d[dq], m.Dm + o * N, nr, N, 640,
+                                                   N, m.h8s, cs)) {
+                        err = "prefill: the MXFP4 FP8 down GEMM did not launch";
+                        return false;
+                    }
+                } else {
+                    m.gemm.f16(m.Hh + o * 640, m.dq_d[dq], m.Dm + o * N, nr, N, 640);
+                }
                 if (j + 1 < gp.j1) continue;
                 pt.mark(kPfCombine, cs);
                 moe_scatter_add(m.Dm, d_u_tok + gp.u_at, d_u_off + gp.uo_at, d_u_rows + gp.r0,

@@ -40,6 +40,13 @@ void iq_embed_rows(int ggml_type, const void* table, size_t row_bytes, const int
 void iq_dequant_gu_f16(int ggml_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst,
                        void* stream, const float* tail = nullptr);
 
+/// STRATA_MXFP4_FP8 (vLLM's Quark W4A8 compute model): MXFP4 experts to E4M3 with their E8M0 block scale folded in
+/// (the interleaved gate/up layout iq_dequant_gu_f16 writes), and the chunk's FP16 activations to E4M3 per row.
+void iq_dequant_gu_mxfp4_fp8(int ggml_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd,
+                             uint8_t* dst, void* stream);
+void iq_dequant_mxfp4_fp8(int ggml_type, const void* src, int64_t n, uint8_t* dst, void* stream);
+void quantize_fp8_rows(const void* x, int64_t rows, int64_t cols, uint8_t* y, float* scale, void* stream);
+
 /// The layout of one native expert blob: [gate rows | up rows | down rows], raw GGUF blocks.
 struct NativeExpertLayout {
     int gu_type = -1, d_type = -1;
