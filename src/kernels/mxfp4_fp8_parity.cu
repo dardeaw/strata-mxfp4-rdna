@@ -134,8 +134,7 @@ void test_quant() {
     hipFree(dx); hipFree(dy); hipFree(dsc);
 }
 
-void test_gemm(int T) {
-    const int N = 1280, K = 2560;
+void test_gemm(int T, int N = 1280, int K = 2560) {
     std::vector<uint8_t> X((size_t) T * K), W((size_t) N * K);
     std::vector<float> rs(T), Y((size_t) T * N), ref((size_t) T * N);
     std::mt19937 rng(77 + T);
@@ -207,8 +206,11 @@ void bench_gemm(int T, int N, int K, int reps) {
 int main() {
     test_dequant();
     test_quant();
-    test_gemm(40);
-    test_gemm(17);
+    test_gemm(40);              // 32x32 kernel
+    test_gemm(17);              // 32x32 kernel, partial tile
+    test_gemm(128);             // 32x32 kernel (below the 4x4 threshold)
+    test_gemm(256);             // 64x64 kernel, up-projection shape
+    test_gemm(200, 2560, 640);  // 32x32 kernel, the down-projection shape
     bench_gemm(64, 1280, 2560, 20);
     bench_gemm(128, 1280, 2560, 20);
     bench_gemm(256, 1280, 2560, 10);
