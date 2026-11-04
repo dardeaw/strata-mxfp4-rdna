@@ -1,0 +1,37 @@
+{
+ "exe": "/home/nobara-user/strata-0210/engine/strata",
+ "args": [
+  "--pack",
+  "/home/nobara-user/Strata-data/packs/tsaipifong-mxfp4",
+  "--native",
+  "/home/nobara-user/Strata-data/models/tsaipifong-mxfp4/Swift-1.5-Qwen3.8-Flash-Next-MXFP4-ple-IQ4_NL-00001-of-00003.gguf",
+  "--expert-profile",
+  "/home/nobara-user/strata-0210/data/expert-profile.bin",
+  "--expert-cache",
+  "auto",
+  "--prefill",
+  "auto",
+  "--spec",
+  "4",
+  "--max-context",
+  "262144",
+  "--kv",
+  "int8",
+  "--resident-budget-gib",
+  "50",
+  "--pool-workers",
+  "13",
+  "--kv-grow"
+ ],
+ "cwd": "/home/nobara-user/strata-0210",
+ "tokenizer": "/home/nobara-user/Strata-data/packs/tsaipifong-mxfp4/tokenizer",
+ "model_name": "qwen3.8-flash-next-tsaipifong-mxfp4",
+ "log": "/home/nobara-user/strata-0210/strata-mxfp4-rdna.log",
+ "lib_dirs": [
+  "/home/nobara-user/strata-0210/.venv/lib64/python3.14/site-packages/_rocm_sdk_devel/lib",
+  "/home/nobara-user/strata-0210/.venv/lib64/python3.14/site-packages/_rocm_sdk_libraries_gfx120X_all/lib",
+  "/home/nobara-user/strata-0210/.venv/lib/python3.14/site-packages/_rocm_sdk_libraries_gfx120X_all/lib"
+ ],
+ "port": 8081,
+ "backend": "hip"
+}

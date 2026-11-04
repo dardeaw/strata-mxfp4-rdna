@@ -1,3 +1,5 @@
+> **MXFP4 for RDNA4 (this fork).** This fork adds the MXFP4 (E2M1/E8M0) expert path and the FP8 (E4M3) W4A8 compute for AMD RDNA4 / gfx12, with the `--kv-grow` expert-cache configuration as the default. See [README-MXFP4-RDNA.md](README-MXFP4-RDNA.md) and [CHANGELOG.md](CHANGELOG.md). This is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata); it is unrelated to gufo, MBufo and halogen.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
