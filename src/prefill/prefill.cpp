@@ -5819,9 +5819,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
                             pt.mark(kPfGemmGU, cs);
                             if (fp8) {
-                                strata::kernels::quantize_fp8_rows(m.Xs + o0 * N, ne, N, m.x8, m.x8s + o0, m.cs);
+                                strata::kernels::quantize_fp8_rows(m.Xs + o0 * N, ne, N, m.x8, m.x8s, m.cs);
                                 if (!strata::prefill::fp8_gemm(m.x8, (const uint8_t*) m.dq_gu[q], m.GU + o0 * 1280, ne, 1280,
-                                                               N, 1280, m.x8s + o0, m.cs)) {
+                                                               N, 1280, m.x8s, m.cs)) {
                                     err = "prefill: the MXFP4 FP8 gate/up GEMM did not launch";
                                     return false;
                                 }
@@ -5840,9 +5840,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (had_d) strata::kernels::hadamard_rows_f16(m.Hh + o0 * 640, ne, 640, had_block, had_sh, m.cs);
                             pt.mark(kPfGemmD, cs);
                             if (fp8) {
-                                strata::kernels::quantize_fp8_rows(m.Hh + o0 * 640, ne, 640, m.h8, m.h8s + o0, m.cs);
+                                strata::kernels::quantize_fp8_rows(m.Hh + o0 * 640, ne, 640, m.h8, m.h8s, m.cs);
                                 if (!strata::prefill::fp8_gemm(m.h8, (const uint8_t*) m.dq_d[q], m.Dm + o0 * N, ne, N, 640,
-                                                               N, m.h8s + o0, m.cs)) {
+                                                               N, m.h8s, m.cs)) {
                                     err = "prefill: the MXFP4 FP8 down GEMM did not launch";
                                     return false;
                                 }
