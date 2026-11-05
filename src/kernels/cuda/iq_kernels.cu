@@ -5490,22 +5490,21 @@ void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, in
 __device__ __forceinline__ uint8_t f32_to_e4m3(float v) {
     const uint32_t u = __float_as_uint(v);
     const uint8_t sign = (uint8_t) ((u >> 24) & 0x80u);
-    const float a = fabsf(v);
-    if (a != a) return (uint8_t) (sign | 0x7Fu);          // NaN
-    if (a >= 448.0f) return (uint8_t) (sign | 0x7Eu);     // OCP E4M3 has no inf: saturate
-    if (a < (1.0f / 1024.0f)) return sign;                // below half the smallest subnormal
-    int e = 0;
-    const float m = frexpf(a, &e);                        // a = m * 2^e, m in [0.5, 1)
-    int ex = e - 1;                                       // value = 1.mmm * 2^ex
-    int mant = __float2int_rn((m * 2.0f - 1.0f) * 8.0f);
-    if (mant == 8) { mant = 0; ++ex; }
-    if (ex >= -6) {                                       // normal (or the max normal)
-        if (ex > 8 || (ex == 8 && mant > 6)) return (uint8_t) (sign | 0x7Eu);
-        return (uint8_t) (sign | ((ex + 7) << 3) | mant);
+    const uint32_t a = u & 0x7fffffffu;
+    if (a > 0x7f800000u) return (uint8_t) (sign | 0x7Fu);   // NaN
+    if (a == 0x7f800000u) return (uint8_t) (sign | 0x7Eu);  // inf -> saturate
+    if (a < 0x3a800000u) return sign;                        // < 2^-9
+    if (a < 0x3c800000u) {                                    // subnormal, 2^-9 units
+        const int q = __float2int_rn(__uint_as_float(a) * 512.0f);
+        return (uint8_t) (sign | (q >= 8 ? 0x08 : q));
     }
-    const int sub = __float2int_rn(a * 512.0f);           // subnormal, 2^-9 units
-    if (sub >= 8) return (uint8_t) (sign | 0x08u);
-    return (uint8_t) (sign | sub);
+    int e = (int) ((a >> 23) & 0xFFu) - 127;
+    if (e > 8) return (uint8_t) (sign | 0x7Eu);
+    const uint32_t m = a & 0x7FFFFFu;
+    uint32_t mant = (m + 0x0007FFFFu + ((m >> 20) & 1u)) >> 20;  // RNE, 3 mantissa bits
+    if (mant == 8) { mant = 0; ++e; }
+    if (e == 8 && mant > 6) return (uint8_t) (sign | 0x7Eu);
+    return (uint8_t) (sign | ((e + 7) << 3) | mant);
 }
 
 // 256 values (8 MXFP4 blocks) per block, 32 threads: thread tid owns block tid%8, quarter tid/8.

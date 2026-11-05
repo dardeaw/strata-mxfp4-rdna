@@ -14,6 +14,7 @@
 #include "strata/artifact/dequant.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/prefill/fp8_gemm.hpp"
+#include "strata/prefill/mxfp4_gemm.hpp"
 
 namespace {
 
@@ -201,11 +202,403 @@ void bench_gemm(int T, int N, int K, int reps) {
     hipFree(dX); hipFree(dW); hipFree(dY); hipFree(dR);
 }
 
+
+void test_mxfp4_gemm() {
+    const int n_ff = 64, n_embd = 256;
+    const int Kgu = n_embd, Ngu = 2 * n_ff;
+    const int Kd = n_ff, Nd = n_embd;
+    const int gu_rb = (Kgu / 32) * 17, d_rb = (Kd / 32) * 17;
+    std::vector<uint8_t> gate((size_t) n_ff * gu_rb), up((size_t) n_ff * gu_rb), down((size_t) n_embd * d_rb);
+    std::mt19937 rng(0x5eed);
+    auto fill = [&](std::vector<uint8_t>& w, int rows, int rb) {
+        for (int r = 0; r < rows; ++r)
+            for (int b = 0; b < rb / 17; ++b) {
+                uint8_t* blk = w.data() + (size_t) r * rb + (size_t) b * 17;
+                blk[0] = (uint8_t) (100 + (rng() % 40));
+                for (int j = 0; j < 16; ++j) blk[1 + j] = (uint8_t) (rng() & 0xFF);
+            }
+    };
+    fill(gate, n_ff, gu_rb); fill(up, n_ff, gu_rb); fill(down, n_embd, d_rb);
+
+    for (int T : {128, 33}) {
+        std::vector<uint8_t> X((size_t) T * Kgu), Xd((size_t) T * Kd);
+        std::vector<float> rs(T); for (int tt = 0; tt < T; ++tt) rs[tt] = 0.25f + 0.01f * tt;
+        for (auto& v : X) v = ref_e4m3(((int) (rng() % 2001) - 1000) / 125.0f);
+        for (auto& v : Xd) v = ref_e4m3(((int) (rng() % 2001) - 1000) / 125.0f);
+
+        uint8_t* dX = (uint8_t*) dev_alloc(X.size(), "mx X");
+        uint8_t* dXd = (uint8_t*) dev_alloc(Xd.size(), "mx Xd");
+        uint8_t* dG = (uint8_t*) dev_alloc(gate.size(), "mx gate");
+        uint8_t* dU = (uint8_t*) dev_alloc(up.size(), "mx up");
+        uint8_t* dD = (uint8_t*) dev_alloc(down.size(), "mx down");
+        float* dR = (float*) dev_alloc(T * sizeof(float), "mx rs");
+        float* dY = (float*) dev_alloc((size_t) T * Nd * 4, "mx Y");
+        CHECK(hipMemcpy(dX, X.data(), X.size(), hipMemcpyHostToDevice) == hipSuccess, "mx X up");
+        CHECK(hipMemcpy(dXd, Xd.data(), Xd.size(), hipMemcpyHostToDevice) == hipSuccess, "mx Xd up");
+        CHECK(hipMemcpy(dG, gate.data(), gate.size(), hipMemcpyHostToDevice) == hipSuccess, "mx gate up");
+        CHECK(hipMemcpy(dU, up.data(), up.size(), hipMemcpyHostToDevice) == hipSuccess, "mx up up");
+        CHECK(hipMemcpy(dD, down.data(), down.size(), hipMemcpyHostToDevice) == hipSuccess, "mx down up");
+        CHECK(hipMemcpy(dR, rs.data(), T * sizeof(float), hipMemcpyHostToDevice) == hipSuccess, "mx rs up");
+
+        // control: pre-dequant to an FP8 buffer, then the proven fp8_gemm.
+        {
+            uint8_t* dF = (uint8_t*) dev_alloc((size_t) Ngu * Kgu, "mx F");
+            strata::kernels::iq_dequant_gu_mxfp4_fp8(39, dG, dU, n_ff, n_embd, dF, nullptr);
+            CHECK(hipDeviceSynchronize() == hipSuccess, "mx predequant sync");
+            {
+                std::vector<uint8_t> Frow((size_t) Ngu * Kgu);
+                CHECK(hipMemcpy(Frow.data(), dF, Frow.size(), hipMemcpyDeviceToHost) == hipSuccess, "mx Frow");
+                int fb = 0;
+                for (int n = 0; n < Ngu; ++n) {
+                    const int src = n >> 1;
+                    const std::vector<uint8_t>& w = (n & 1) ? up : gate;
+                    const uint8_t* row = w.data() + (size_t) src * gu_rb;
+                    for (int k = 0; k < Kgu; ++k) {
+                        float vals[32];
+                        strata::dequantize_mxfp4(row + (size_t) (k / 32) * 17, vals);
+                        const uint8_t want = ref_e4m3(vals[k % 32]);
+                        if (Frow[(size_t) n * Kgu + k] != want) {
+                            if (fb < 6) std::printf("Frow n=%d k=%d got 0x%02x want 0x%02x\n", n, k, Frow[(size_t) n * Kgu + k], want);
+                            ++fb;
+                        }
+                    }
+                }
+                std::printf("Frow: %d mismatches / %d\n", fb, Ngu * Kgu);
+            }
+            CHECK(strata::prefill::fp8_gemm(dX, dF, dY, T, Ngu, Kgu, Ngu, dR, nullptr), "mx predequant gemm T=%d", T);
+            CHECK(hipDeviceSynchronize() == hipSuccess, "mx predequant gemm sync");
+            std::vector<float> Yp((size_t) T * Ngu);
+            CHECK(hipMemcpy(Yp.data(), dY, Yp.size() * 4, hipMemcpyDeviceToHost) == hipSuccess, "mx predequant down");
+            int pb = 0;
+            double pw = 0;
+            for (int n = 0; n < Ngu; ++n) {
+                const int src = n >> 1;
+                const std::vector<uint8_t>& w = (n & 1) ? up : gate;
+                const uint8_t* row = w.data() + (size_t) src * gu_rb;
+                for (int t = 0; t < T; ++t) {
+                    double s = 0;
+                    for (int k = 0; k < Kgu; ++k) {
+                        float vals[32];
+                        strata::dequantize_mxfp4(row + (size_t) (k / 32) * 17, vals);
+                        s += (double) dec_e4m3(X[(size_t) t * Kgu + k]) * (double) ref_e4m3(vals[k % 32]);
+                    }
+                    const float want = (float) (s * rs[t]);
+                    const float got = Yp[(size_t) t * Ngu + n];
+                    const double rel = std::fabs((double) got - want) / std::fmax(1.0, std::fabs((double) want));
+                    pw = std::fmax(pw, rel);
+                    if (rel > 2e-4) ++pb;
+                }
+            }
+            CHECK(pb == 0, "mx predequant T=%d: %d bad (worst %.2g)", T, pb, pw);
+            std::printf("mx predequant T=%d: worst rel %.2g, bad %d\n", T, pw, pb);
+            hipFree(dF);
+        }
+
+        // Control: same dX/dF/rs, the proven fp8_gemm; compare its output with the in-kernel result.
+        std::vector<float> Yref((size_t) T * Ngu);
+        {
+            uint8_t* dF2 = (uint8_t*) dev_alloc((size_t) Ngu * Kgu, "mx F2");
+            strata::kernels::iq_dequant_gu_mxfp4_fp8(39, dG, dU, n_ff, n_embd, dF2, nullptr);
+            CHECK(hipDeviceSynchronize() == hipSuccess, "mx ref sync");
+            CHECK(strata::prefill::fp8_gemm(dX, dF2, dY, T, Ngu, Kgu, Ngu, dR, nullptr), "mx ref gemm T=%d", T);
+            CHECK(hipDeviceSynchronize() == hipSuccess, "mx ref gemm sync");
+            CHECK(hipMemcpy(Yref.data(), dY, Yref.size() * 4, hipMemcpyDeviceToHost) == hipSuccess, "mx ref down");
+            hipFree(dF2);
+        }
+        CHECK(strata::prefill::mxfp4_gemm_gu(dX, dG, dU, dY, T, Ngu, Kgu, Ngu, dR, nullptr), "mxfp4 gu T=%d", T);
+        CHECK(hipDeviceSynchronize() == hipSuccess, "mx gu sync");
+        std::vector<float> Ygu((size_t) T * Ngu);
+        CHECK(hipMemcpy(Ygu.data(), dY, Ygu.size() * 4, hipMemcpyDeviceToHost) == hipSuccess, "mx gu down");
+        int bad = 0;
+        double worst = 0;
+        for (int n = 0; n < Ngu; ++n) {
+            const int src = n >> 1;
+            const std::vector<uint8_t>& w = (n & 1) ? up : gate;
+            const uint8_t* row = w.data() + (size_t) src * gu_rb;
+            for (int t = 0; t < T; ++t) {
+                double s = 0;
+                for (int k = 0; k < Kgu; ++k) {
+                    float vals[32];
+                    strata::dequantize_mxfp4(row + (size_t) (k / 32) * 17, vals);
+                    s += (double) dec_e4m3(X[(size_t) t * Kgu + k]) * (double) ref_e4m3(vals[k % 32]);
+                }
+                const float want = (float) (s * rs[t]);
+                const float got = Ygu[(size_t) t * Ngu + n];
+                const double rel = std::fabs((double) got - want) / std::fmax(1.0, std::fabs((double) want));
+                worst = std::fmax(worst, rel);
+                if (rel > 2e-4) {
+                    if (bad < 5) std::printf("mx gu T=%d [%d][%d] got %.6g want %.6g rel %.2g\n", T, t, n, got, want, rel);
+                    ++bad;
+                }
+            }
+        }
+        CHECK(bad == 0, "mx gu T=%d: %d bad (worst %.2g)", T, bad, worst);
+        std::printf("mx gu T=%d: worst rel %.2g, bad %d\n", T, worst, bad);
+        {
+            double md = 0;
+            for (size_t i = 0; i < Ygu.size(); ++i) md = std::fmax(md, std::fabs((double) Ygu[i] - (double) Yref[i]));
+            std::printf("mx in-kernel vs pre-dequant ref T=%d: max abs diff %.3g\n", T, md);
+        }
+
+        CHECK(strata::prefill::mxfp4_gemm_d(dXd, dD, dY, T, Nd, Kd, Nd, dR, nullptr), "mxfp4 d T=%d", T);
+        CHECK(hipDeviceSynchronize() == hipSuccess, "mx d sync");
+        std::vector<float> Yd((size_t) T * Nd);
+        CHECK(hipMemcpy(Yd.data(), dY, Yd.size() * 4, hipMemcpyDeviceToHost) == hipSuccess, "mx d down");
+        bad = 0;
+        worst = 0;
+        for (int n = 0; n < Nd; ++n) {
+            const uint8_t* row = down.data() + (size_t) n * d_rb;
+            for (int t = 0; t < T; ++t) {
+                double s = 0;
+                for (int k = 0; k < Kd; ++k) {
+                    float vals[32];
+                    strata::dequantize_mxfp4(row + (size_t) (k / 32) * 17, vals);
+                    s += (double) dec_e4m3(Xd[(size_t) t * Kd + k]) * (double) ref_e4m3(vals[k % 32]);
+                }
+                const float want = (float) (s * rs[t]);
+                const float got = Yd[(size_t) t * Nd + n];
+                const double rel = std::fabs((double) got - want) / std::fmax(1.0, std::fabs((double) want));
+                worst = std::fmax(worst, rel);
+                if (rel > 2e-4) {
+                    if (bad < 5) std::printf("mx d T=%d [%d][%d] got %.6g want %.6g rel %.2g\n", T, t, n, got, want, rel);
+                    ++bad;
+                }
+            }
+        }
+        CHECK(bad == 0, "mx d T=%d: %d bad (worst %.2g)", T, bad, worst);
+        std::printf("mx d T=%d: worst rel %.2g, bad %d\n", T, worst, bad);
+        hipFree(dX); hipFree(dXd); hipFree(dG); hipFree(dU); hipFree(dD); hipFree(dR); hipFree(dY);
+    }
+}
+
+
+// ---- Grouped in-kernel MXFP4 (zero global staging) vs pre-dequant grouped ----
+// Real prefill shapes (n_embd = 2560): GU X[T,2560] -> Y[T,1280] (gate/up blobs
+// interleaved as 2*r + parity), D H[T,640] -> Dm[T,2560]. A batch holds E experts,
+// expert e owning chunk rows [e*T, e*T+T) of X / H and their row scales.
+struct GroupedBatch {
+    int T = 0, E = 0;
+    uint8_t *dX = nullptr, *dH = nullptr;
+    float *dXs = nullptr, *dHs = nullptr;
+    uint8_t *dGate = nullptr, *dUp = nullptr, *dDown = nullptr;
+    uint8_t *dFgu = nullptr, *dFd = nullptr;
+    float *dYg0 = nullptr, *dYg1 = nullptr, *dYd0 = nullptr, *dYd1 = nullptr;
+    strata::prefill::Fp8GroupTile *tFgu = nullptr, *tFd = nullptr;
+    strata::prefill::Mxfp4ExpertTile *tMgu = nullptr, *tMd = nullptr;
+    std::vector<strata::prefill::Fp8GroupTile> fgu, fd;
+    std::vector<strata::prefill::Mxfp4ExpertTile> mgu, md;
+};
+
+GroupedBatch grouped_make(int T, int E) {
+    GroupedBatch b;
+    b.T = T; b.E = E;
+    const int n_ff = 1280 / 2, Kgu = 2560, Ngu = 1280, Kd = 640, Nd = 2560;
+    const int gu_rb = (Kgu / 32) * 17, d_rb = (Kd / 32) * 17;
+    std::mt19937 rng(9107 + T * 131 + E);
+    std::vector<uint8_t> gate((size_t) E * n_ff * gu_rb), up((size_t) E * n_ff * gu_rb),
+        down((size_t) E * Nd * d_rb);
+    auto fill_w = [&](std::vector<uint8_t>& w, int rows, int rb) {
+        for (int r = 0; r < rows; ++r)
+            for (int bb = 0; bb < rb / 17; ++bb) {
+                uint8_t* blk = w.data() + (size_t) r * rb + (size_t) bb * 17;
+                blk[0] = (uint8_t) (100 + (rng() % 40));
+                for (int j = 0; j < 16; ++j) blk[1 + j] = (uint8_t) (rng() & 0xFF);
+            }
+    };
+    fill_w(gate, E * n_ff, gu_rb);
+    fill_w(up, E * n_ff, gu_rb);
+    fill_w(down, E * Nd, d_rb);
+    std::vector<_Float16> Xh((size_t) E * T * Kgu), Hh((size_t) E * T * Kd);
+    for (auto& v : Xh) v = (_Float16) (((int) (rng() % 2001) - 1000) / 125.0f);
+    for (auto& v : Hh) v = (_Float16) (((int) (rng() % 2001) - 1000) / 125.0f);
+    b.dX = (uint8_t*) dev_alloc((size_t) E * T * Kgu, "gb X");
+    b.dH = (uint8_t*) dev_alloc((size_t) E * T * Kd, "gb H");
+    b.dXs = (float*) dev_alloc((size_t) E * T * 4, "gb Xs");
+    b.dHs = (float*) dev_alloc((size_t) E * T * 4, "gb Hs");
+    b.dGate = (uint8_t*) dev_alloc(gate.size(), "gb gate");
+    b.dUp = (uint8_t*) dev_alloc(up.size(), "gb up");
+    b.dDown = (uint8_t*) dev_alloc(down.size(), "gb down");
+    b.dFgu = (uint8_t*) dev_alloc((size_t) E * Ngu * Kgu, "gb Fgu");
+    b.dFd = (uint8_t*) dev_alloc((size_t) E * Nd * Kd, "gb Fd");
+    b.dYg0 = (float*) dev_alloc((size_t) E * T * Ngu * 4, "gb Yg0");
+    b.dYg1 = (float*) dev_alloc((size_t) E * T * Ngu * 4, "gb Yg1");
+    b.dYd0 = (float*) dev_alloc((size_t) E * T * Nd * 4, "gb Yd0");
+    b.dYd1 = (float*) dev_alloc((size_t) E * T * Nd * 4, "gb Yd1");
+    _Float16* dx = (_Float16*) dev_alloc(Xh.size() * 2, "gb Xh");
+    _Float16* dh = (_Float16*) dev_alloc(Hh.size() * 2, "gb Hh");
+    CHECK(hipMemcpy(dx, Xh.data(), Xh.size() * 2, hipMemcpyHostToDevice) == hipSuccess, "gb Xh up");
+    CHECK(hipMemcpy(dh, Hh.data(), Hh.size() * 2, hipMemcpyHostToDevice) == hipSuccess, "gb Hh up");
+    CHECK(hipMemcpy(b.dGate, gate.data(), gate.size(), hipMemcpyHostToDevice) == hipSuccess, "gb gate up");
+    CHECK(hipMemcpy(b.dUp, up.data(), up.size(), hipMemcpyHostToDevice) == hipSuccess, "gb up up");
+    CHECK(hipMemcpy(b.dDown, down.data(), down.size(), hipMemcpyHostToDevice) == hipSuccess, "gb down up");
+    strata::kernels::quantize_fp8_rows(dx, (int64_t) E * T, Kgu, b.dX, b.dXs, nullptr);
+    strata::kernels::quantize_fp8_rows(dh, (int64_t) E * T, Kd, b.dH, b.dHs, nullptr);
+    hipFree(dx); hipFree(dh);
+    const int64_t nGuN = Ngu / 64, nDN = Nd / 64, nM = (T + 255) / 256;
+    for (int e = 0; e < E; ++e) {
+        const uint8_t* G = b.dGate + (size_t) e * n_ff * gu_rb;
+        const uint8_t* U = b.dUp + (size_t) e * n_ff * gu_rb;
+        const uint8_t* D = b.dDown + (size_t) e * Nd * d_rb;
+        const uint8_t* Fg = b.dFgu + (size_t) e * Ngu * Kgu;
+        const uint8_t* Fd = b.dFd + (size_t) e * Nd * Kd;
+        float* Yg0 = b.dYg0 + (size_t) e * T * Ngu;
+        float* Yg1 = b.dYg1 + (size_t) e * T * Ngu;
+        float* Yd0 = b.dYd0 + (size_t) e * T * Nd;
+        float* Yd1 = b.dYd1 + (size_t) e * T * Nd;
+        const int64_t ts = (int64_t) e * T;
+        for (int64_t nt = 0; nt < nGuN; ++nt)
+            for (int64_t mg = 0; mg < nM; ++mg) {
+                b.fgu.push_back({Fg, Yg0, ts, T, nt, mg, Ngu, Kgu, Ngu});
+                strata::prefill::Mxfp4ExpertTile t;
+                t.blob = G; t.up = U; t.out = Yg1;
+                t.t_start = ts; t.t_count = T; t.n_tile = nt; t.m_group = mg;
+                t.N = Ngu; t.K = Kgu; t.ldy = Ngu; t.row_bytes = gu_rb;
+                b.mgu.push_back(t);
+            }
+        for (int64_t nt = 0; nt < nDN; ++nt)
+            for (int64_t mg = 0; mg < nM; ++mg) {
+                b.fd.push_back({Fd, Yd0, ts, T, nt, mg, Nd, Kd, Nd});
+                strata::prefill::Mxfp4ExpertTile t;
+                t.blob = D; t.up = nullptr; t.out = Yd1;
+                t.t_start = ts; t.t_count = T; t.n_tile = nt; t.m_group = mg;
+                t.N = Nd; t.K = Kd; t.ldy = Nd; t.row_bytes = d_rb;
+                b.md.push_back(t);
+            }
+    }
+    b.tFgu = (strata::prefill::Fp8GroupTile*) dev_alloc(b.fgu.size() * sizeof(strata::prefill::Fp8GroupTile), "gb tFgu");
+    b.tFd = (strata::prefill::Fp8GroupTile*) dev_alloc(b.fd.size() * sizeof(strata::prefill::Fp8GroupTile), "gb tFd");
+    b.tMgu = (strata::prefill::Mxfp4ExpertTile*) dev_alloc(b.mgu.size() * sizeof(strata::prefill::Mxfp4ExpertTile), "gb tMgu");
+    b.tMd = (strata::prefill::Mxfp4ExpertTile*) dev_alloc(b.md.size() * sizeof(strata::prefill::Mxfp4ExpertTile), "gb tMd");
+    CHECK(hipMemcpy(b.tFgu, b.fgu.data(), b.fgu.size() * sizeof(strata::prefill::Fp8GroupTile), hipMemcpyHostToDevice) == hipSuccess, "gb tFgu up");
+    CHECK(hipMemcpy(b.tFd, b.fd.data(), b.fd.size() * sizeof(strata::prefill::Fp8GroupTile), hipMemcpyHostToDevice) == hipSuccess, "gb tFd up");
+    CHECK(hipMemcpy(b.tMgu, b.mgu.data(), b.mgu.size() * sizeof(strata::prefill::Mxfp4ExpertTile), hipMemcpyHostToDevice) == hipSuccess, "gb tMgu up");
+    CHECK(hipMemcpy(b.tMd, b.md.data(), b.md.size() * sizeof(strata::prefill::Mxfp4ExpertTile), hipMemcpyHostToDevice) == hipSuccess, "gb tMd up");
+    return b;
+}
+
+void grouped_free(GroupedBatch& b) {
+    hipFree(b.dX); hipFree(b.dH); hipFree(b.dXs); hipFree(b.dHs);
+    hipFree(b.dGate); hipFree(b.dUp); hipFree(b.dDown);
+    hipFree(b.dFgu); hipFree(b.dFd);
+    hipFree(b.dYg0); hipFree(b.dYg1); hipFree(b.dYd0); hipFree(b.dYd1);
+    hipFree(b.tFgu); hipFree(b.tFd); hipFree(b.tMgu); hipFree(b.tMd);
+}
+
+// Reference: per-expert dequant to a global FP8 buffer, then the proven grouped GEMMs.
+void grouped_run_pre(GroupedBatch& b) {
+    const int n_ff = 640, Kgu = 2560, Ngu = 1280, Kd = 640, Nd = 2560;
+    const int gu_rb = (Kgu / 32) * 17, d_rb = (Kd / 32) * 17;
+    for (int e = 0; e < b.E; ++e) {
+        strata::kernels::iq_dequant_gu_mxfp4_fp8(39, b.dGate + (size_t) e * n_ff * gu_rb,
+            b.dUp + (size_t) e * n_ff * gu_rb, n_ff, Kgu, b.dFgu + (size_t) e * Ngu * Kgu, nullptr);
+        strata::kernels::iq_dequant_mxfp4_fp8(39, b.dDown + (size_t) e * Nd * d_rb,
+            (int64_t) Nd * Kd, b.dFd + (size_t) e * Nd * Kd, nullptr);
+    }
+    CHECK(strata::prefill::fp8_grouped_gemm(b.dX, b.dXs, b.tFgu, (int) b.fgu.size(), nullptr), "gb pre gu");
+    CHECK(strata::prefill::fp8_grouped_gemm(b.dH, b.dHs, b.tFd, (int) b.fd.size(), nullptr), "gb pre d");
+}
+
+// Candidate: in-kernel LUT dequant, no global staging buffer.
+void grouped_run_ink(GroupedBatch& b) {
+    CHECK(strata::prefill::mxfp4_grouped_gemm_gu(b.dX, b.dXs, b.tMgu, (int) b.mgu.size(), nullptr), "gb ink gu");
+    CHECK(strata::prefill::mxfp4_grouped_gemm_d(b.dH, b.dHs, b.tMd, (int) b.md.size(), nullptr), "gb ink d");
+}
+
+void test_mxfp4_grouped_parity(int T, int E) {
+    GroupedBatch b = grouped_make(T, E);
+    grouped_run_pre(b);
+    CHECK(hipDeviceSynchronize() == hipSuccess, "gb pre sync");
+    grouped_run_ink(b);
+    CHECK(hipDeviceSynchronize() == hipSuccess, "gb ink sync");
+    std::vector<float> g0((size_t) E * T * 1280), g1((size_t) E * T * 1280);
+    std::vector<float> d0((size_t) E * T * 2560), d1((size_t) E * T * 2560);
+    CHECK(hipMemcpy(g0.data(), b.dYg0, g0.size() * 4, hipMemcpyDeviceToHost) == hipSuccess, "gb g0 down");
+    CHECK(hipMemcpy(g1.data(), b.dYg1, g1.size() * 4, hipMemcpyDeviceToHost) == hipSuccess, "gb g1 down");
+    CHECK(hipMemcpy(d0.data(), b.dYd0, d0.size() * 4, hipMemcpyDeviceToHost) == hipSuccess, "gb d0 down");
+    CHECK(hipMemcpy(d1.data(), b.dYd1, d1.size() * 4, hipMemcpyDeviceToHost) == hipSuccess, "gb d1 down");
+    double mg = 0, md = 0;
+    for (size_t i = 0; i < g0.size(); ++i) mg = std::fmax(mg, std::fabs((double) g0[i] - (double) g1[i]));
+    for (size_t i = 0; i < d0.size(); ++i) md = std::fmax(md, std::fabs((double) d0[i] - (double) d1[i]));
+    std::printf("grouped parity T=%d E=%d: gu maxabs %.3g, d maxabs %.3g\n", T, E, mg, md);
+    CHECK(mg == 0.0, "grouped gu T=%d E=%d maxabs %.3g", T, E, mg);
+    CHECK(md == 0.0, "grouped d T=%d E=%d maxabs %.3g", T, E, md);
+    grouped_free(b);
+}
+
+static float grouped_event_ms(hipEvent_t a, hipEvent_t b) {
+    float ms = 0;
+    CHECK(hipEventElapsedTime(&ms, a, b) == hipSuccess, "gb elapsed");
+    return ms;
+}
+
+void bench_mxfp4_grouped(int T, int E) {
+    GroupedBatch b = grouped_make(T, E);
+    grouped_run_pre(b);
+    grouped_run_ink(b);
+    CHECK(hipDeviceSynchronize() == hipSuccess, "gb warmup sync");
+    hipEvent_t a, ev;
+    hipEventCreate(&a); hipEventCreate(&ev);
+    const double flops = (double) E * 2.0 * T * (1280.0 * 2560.0 + 2560.0 * 640.0);
+    const double flops_gu = (double) E * 2.0 * T * 1280.0 * 2560.0;
+    const double flops_d = (double) E * 2.0 * T * 2560.0 * 640.0;
+    float pre[3], ink[3], preg[3], inkg[3], pred[3], inkd[3];
+    for (int i = 0; i < 3; ++i) {
+        hipEventRecord(a);
+        grouped_run_pre(b);
+        hipEventRecord(ev);
+        CHECK(hipEventSynchronize(ev) == hipSuccess, "gb pre sync");
+        pre[i] = grouped_event_ms(a, ev);
+        hipEventRecord(a);
+        grouped_run_ink(b);
+        hipEventRecord(ev);
+        CHECK(hipEventSynchronize(ev) == hipSuccess, "gb ink sync");
+        ink[i] = grouped_event_ms(a, ev);
+        hipEventRecord(a);
+        CHECK(strata::prefill::fp8_grouped_gemm(b.dX, b.dXs, b.tFgu, (int) b.fgu.size(), nullptr), "gb t preg");
+        hipEventRecord(ev);
+        CHECK(hipEventSynchronize(ev) == hipSuccess, "gb preg sync");
+        preg[i] = grouped_event_ms(a, ev);
+        hipEventRecord(a);
+        CHECK(strata::prefill::mxfp4_grouped_gemm_gu(b.dX, b.dXs, b.tMgu, (int) b.mgu.size(), nullptr), "gb t inkg");
+        hipEventRecord(ev);
+        CHECK(hipEventSynchronize(ev) == hipSuccess, "gb inkg sync");
+        inkg[i] = grouped_event_ms(a, ev);
+        hipEventRecord(a);
+        CHECK(strata::prefill::fp8_grouped_gemm(b.dH, b.dHs, b.tFd, (int) b.fd.size(), nullptr), "gb t pred");
+        hipEventRecord(ev);
+        CHECK(hipEventSynchronize(ev) == hipSuccess, "gb pred sync");
+        pred[i] = grouped_event_ms(a, ev);
+        hipEventRecord(a);
+        CHECK(strata::prefill::mxfp4_grouped_gemm_d(b.dH, b.dHs, b.tMd, (int) b.md.size(), nullptr), "gb t inkd");
+        hipEventRecord(ev);
+        CHECK(hipEventSynchronize(ev) == hipSuccess, "gb inkd sync");
+        inkd[i] = grouped_event_ms(a, ev);
+    }
+    auto med = [](float v[3]) { float x = v[0], y = v[1], z = v[2]; return x < y ? (y < z ? y : (x < z ? z : x)) : (x < z ? x : (y < z ? z : y)); };
+    const float m_pre = med(pre), m_ink = med(ink);
+    std::printf("grouped bench T=%d E=%d (3-run median):\n", T, E);
+    std::printf("  full pre-dequant path : %.3f ms/call (%.2f TFLOPS)\n", m_pre, flops / (m_pre * 1e-3) / 1e12);
+    std::printf("  full in-kernel path   : %.3f ms/call (%.2f TFLOPS)\n", m_ink, flops / (m_ink * 1e-3) / 1e12);
+    std::printf("  speedup: %.2fx\n", m_pre / m_ink);
+    std::printf("  gu launch only: pre %.3f ms vs ink %.3f ms | d launch only: pre %.3f ms vs ink %.3f ms\n",
+        med(preg), med(inkg), med(pred), med(inkd));
+    (void) flops_gu; (void) flops_d;
+    hipEventDestroy(a); hipEventDestroy(ev);
+    grouped_free(b);
+}
+
 }  // namespace
 
 int main() {
     test_dequant();
     test_quant();
+    test_mxfp4_gemm();
+    test_mxfp4_grouped_parity(275, 8);
+    test_mxfp4_grouped_parity(33, 3);
+    bench_mxfp4_grouped(275, 8);
+    bench_mxfp4_grouped(1024, 8);
+    test_gemm(128, 128, 256);   // small shape, 32x32 kernel path
+    test_gemm(33, 128, 256);    // small shape, 32x32 kernel, partial tile
     test_gemm(40);              // 32x32 kernel
     test_gemm(17);              // 32x32 kernel, partial tile
     test_gemm(128);             // 32x32 kernel (below the 4x4 threshold)
