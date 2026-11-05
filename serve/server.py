@@ -5948,6 +5948,7 @@ class Service:
         tail = ""                                       # the last characters written (the newlines before a call)
         answered, close_retried = False, False          # #1053: content or a call came out; the thinking was closed
         nf_retried = False                              # #879: the request was sent again after non-finite logits
+        nf_restarted = False                            # #879: the engine was restarted after the retry also went non-finite
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
@@ -6192,6 +6193,15 @@ class Service:
                                       "dropped its cached state: sending the request again once", flush=True)
                                 continue
                             if n == 0:
+                                if not nf_restarted:
+                                    # a poisoned expert cache / device state survives the in-engine flush (#879);
+                                    # a fresh engine process reloads it, which is what a manual restart does
+                                    nf_restarted = True
+                                    print("[strata] the engine's logits became non-finite again on the retry (#879): "
+                                          "restarting the engine and sending the request once more", flush=True)
+                                    self.engine.restart()
+                                    del segments[segments_before:]
+                                    continue
                                 finish = "error"
                                 print("[strata] the engine's logits became non-finite again on the retry (#879): the "
                                       "request ends with an error", flush=True)

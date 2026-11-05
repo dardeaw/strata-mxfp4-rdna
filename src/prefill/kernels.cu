@@ -3217,6 +3217,27 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
     gather_rows16_kernel<<<blocks_for(n * (width / 8)), 256, 0, (cudaStream_t) stream>>>(x16, src, dst16, n, width);
     check("gather_rows16");
 }
+// Quantize-once gather for the STRATA_MXFP4_FP8 prefill path: the chunk's T rows were quantized once
+// into xc/xcs; the whole [0, TK) gathered range is byte-copied from its source tokens (one block per
+// row, fully occupied, no list or upload).
+__global__ void gather_x8c_full_kernel(const uint8_t* __restrict__ xc, const float* __restrict__ sc,
+                                       const int32_t* __restrict__ src, int64_t TK, int64_t N,
+                                       uint8_t* __restrict__ y, float* __restrict__ ys) {
+    const int64_t p = (int64_t) blockIdx.x;
+    if (p >= TK) return;
+    const int64_t t = (int64_t) src[p];
+    const uint8_t* srow = xc + t * N;
+    uint8_t* drow = y + p * N;
+    const int tid = (int) threadIdx.x;
+    for (int64_t c = tid; c < N; c += 256) drow[c] = srow[c];
+    if (tid == 0) ys[p] = sc[t];
+}
+void gather_x8c_full(const uint8_t* xc, const float* sc, const int32_t* src, int64_t TK, int64_t N,
+                     uint8_t* y, float* ys, void* stream) {
+    if (TK <= 0) return;
+    gather_x8c_full_kernel<<<(unsigned) TK, 256, 0, (cudaStream_t) stream>>>(xc, sc, src, TK, N, y, ys);
+    check("gather_x8c_full");
+}
 namespace {
 __global__ void moe_combine_peer_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
                                         const float* __restrict__ w, const float* __restrict__ shared,

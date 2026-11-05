@@ -107,6 +107,10 @@ void copy_i32(int32_t* dst, const int32_t* src, int64_t n, void* stream);
 void copy_f32_wide(float* dst, const float* src, int64_t n, void* stream);
 /// Gather rows: dst16[i, :] = x16[src[i], :] (n rows of `width` BF16).
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream);
+/// Quantize-once gather (STRATA_MXFP4_FP8 prefill): y[p, :] = xc[src[p], :],
+/// ys[p] = sc[src[p]] for p in [0, TK) (one block per row).
+void gather_x8c_full(const uint8_t* xc, const float* sc, const int32_t* src, int64_t TK, int64_t N,
+                     uint8_t* y, float* ys, void* stream);
 /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream, const float* row_sd = nullptr);
