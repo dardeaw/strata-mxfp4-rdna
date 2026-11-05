@@ -11,4 +11,24 @@ namespace strata::prefill {
 bool fp8_gemm(const uint8_t* X, const uint8_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
               const float* row_scale, void* stream);
 
+/// One tile of a grouped FP8 GEMM: a 64-wide N slice (n_tile) of one expert's rows
+/// [t_start, t_start + t_count), M group m_tile (256 rows, up to 4 M-tiles per block).
+/// w points at that expert's pre-dequantized FP8 matrix (row-major N x K); out at its output rows.
+struct Fp8GroupTile {
+    const uint8_t* w;
+    float* out;
+    int64_t t_start;
+    int64_t t_count;
+    int64_t n_tile;
+    int64_t m_group;
+    int64_t N;
+    int64_t K;
+    int64_t ldy;
+};
+
+/// Grouped FP8 GEMM over pre-dequantized weights: one launch for a whole layer's tiles.
+/// X is the chunk's pre-quantized FP8 activations, row_scale its per-row scales.
+bool fp8_grouped_gemm(const uint8_t* X, const float* row_scale, const Fp8GroupTile* tiles, int num_tiles,
+                       void* stream);
+
 }  // namespace strata::prefill

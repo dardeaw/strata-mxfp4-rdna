@@ -133,6 +133,88 @@ __global__ void fp8_gemm_kernel_4x4(const uint8_t* __restrict__ X, const uint8_t
 // 64x64 output block, 128 threads = 4 waves, A/B staged in LDS once per 16-wide k step and shared by the waves.
 // Each wave computes a 32x32 tile (its own 2x2 WMMA); the block thus reads A once per 64-column strip and B once
 // per 64-row strip, half the global traffic of the 32x32 kernel, with 4 accumulators per lane instead of 16.
+
+// Grouped FP8 GEMM over PRE-DEQUANTIZED weights (no in-kernel dequant).
+// One launch covers a batch of experts: each block owns one (expert, N-tile, M-group).
+// B comes from batch dq buffers (coalesced FP8); A is the hoisted chunk x8.
+// Same LDS 4-wave 64x64 MT structure as fp8_gemm_kernel_lds (proven), plus cross-expert batching.
+__global__ void fp8_gemm_kernel_grouped(const uint8_t* __restrict__ X, const float* __restrict__ rs,
+                                        const strata::prefill::Fp8GroupTile* __restrict__ tiles, int num_tiles) {
+    if ((int) blockIdx.x >= num_tiles) return;
+    const strata::prefill::Fp8GroupTile t = tiles[blockIdx.x];
+    const uint8_t* __restrict__ W = t.w;
+    float* __restrict__ Y = t.out;
+    const int T = (int) t.t_count;
+    const int N = (int) t.N, K = (int) t.K;
+    const int ldy = (int) t.ldy;
+    const int64_t t_start = t.t_start;
+    __shared__ __attribute__((aligned(16))) uint8_t As[4][64 * 16];
+    __shared__ __attribute__((aligned(16))) uint8_t Bs[64 * 16];
+    const int n0 = (int) t.n_tile * 64, tb = (int) t.m_group * 256;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31, wave = tid >> 5;
+    const int msub = wave & 1, nsub = wave >> 1;
+    const int arow = 32 * msub + (lane & 15), brow = 32 * nsub + (lane & 15);
+    const int k8 = 8 * (lane >> 4);
+    const v2i z2 = {0, 0};
+    const int lr = tid >> 1, lk = (tid & 1) * 8;
+    int nm = (T - tb + 63) >> 6;
+    if (nm > 4) nm = 4;
+    if (nm <= 0) return;
+    v8f c[4][4];
+#pragma unroll
+    for (int m = 0; m < 4; ++m)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) c[m][j] = (v8f) {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int k0 = 0; k0 < K; k0 += 16) {
+#pragma unroll
+        for (int m = 0; m < 4; ++m) {
+            const int gr = (int) (t_start + tb + 64 * m + lr);
+            const v2i av = (m < nm && tb + 64 * m + lr < T) ? ld8(X + (size_t) gr * K + k0 + lk) : z2;
+            *reinterpret_cast<v2i*>(As[m] + lr * 16 + lk) = av;
+        }
+        const int n = n0 + lr;
+        const v2i bv = (n < N) ? ld8(W + (size_t) n * K + k0 + lk) : z2;
+        *reinterpret_cast<v2i*>(Bs + lr * 16 + lk) = bv;
+        __syncthreads();
+#pragma unroll
+        for (int m = 0; m < 4; ++m) {
+            if (m >= nm) continue;
+            const v2i a0 = *reinterpret_cast<const v2i*>(As[m] + arow * 16 + k8);
+            const v2i a1 = *reinterpret_cast<const v2i*>(As[m] + (arow + 16) * 16 + k8);
+            const v2i b0 = *reinterpret_cast<const v2i*>(Bs + brow * 16 + k8);
+            const v2i b1 = *reinterpret_cast<const v2i*>(Bs + (brow + 16) * 16 + k8);
+            c[m][0] = wmma(a0, b0, c[m][0]);
+            c[m][1] = wmma(a0, b1, c[m][1]);
+            c[m][2] = wmma(a1, b0, c[m][2]);
+            c[m][3] = wmma(a1, b1, c[m][3]);
+        }
+        __syncthreads();
+    }
+    const int m0 = tb + 32 * msub, n0w = n0 + 32 * nsub;
+    const int col = n0w + (lane & 15);
+#pragma unroll
+    for (int m = 0; m < 4; ++m) {
+        if (m >= nm) continue;
+        const int t0 = tb + 64 * m;
+        const int mm0 = m0 + 32 * (m >> 1) + 16 * (m & 1) - 32 * msub;
+        (void) mm0;
+        for (int i = 0; i < 8; ++i) {
+            const int row = t0 + 32 * msub + 8 * (lane >> 4) + i;
+            if (row >= T) break;
+            const float s0 = rs[t_start + row];
+            if (col >= N) continue;
+            Y[(size_t) row * ldy + col] = c[m][0][i] * s0;
+            Y[(size_t) row * ldy + col + 16] = c[m][1][i] * s0;
+            if (row + 16 < T) {
+                const float s1 = rs[t_start + row + 16];
+                Y[(size_t) (row + 16) * ldy + col] = c[m][2][i] * s1;
+                Y[(size_t) (row + 16) * ldy + col + 16] = c[m][3][i] * s1;
+            }
+        }
+    }
+}
+
 __global__ void fp8_gemm_kernel_lds(const uint8_t* __restrict__ X, const uint8_t* __restrict__ W,
                                     float* __restrict__ Y, int T, int N, int K, int ldy,
                                     const float* __restrict__ rs) {
@@ -183,6 +265,77 @@ __global__ void fp8_gemm_kernel_lds(const uint8_t* __restrict__ X, const uint8_t
     }
 }
 
+// 128x64 FP8 WMMA (lds evolution): 128 threads, 4 waves, each wave 64 rows x 32 cols
+// via 4x2 WMMA (8 accumulators). AI=85 vs 64. Same LDS pattern, doubled M per wave;
+// A staged in two coalesced rounds (rows 0-63, then 64-127).
+__global__ void fp8_gemm_kernel_lds128(const uint8_t* __restrict__ X, const uint8_t* __restrict__ W,
+                                       float* __restrict__ Y, int T, int N, int K, int ldy,
+                                       const float* __restrict__ rs) {
+    __shared__ __attribute__((aligned(16))) uint8_t As[128 * 16];
+    __shared__ __attribute__((aligned(16))) uint8_t Bs[64 * 16];
+    const int n0 = blockIdx.x * 64, t0 = blockIdx.y * 128;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31, wave = tid >> 5;
+    const int wm = (wave >> 1) & 1, wn = wave & 1;
+    const int arow = 64 * wm + (lane & 15), brow = 32 * wn + (lane & 15);
+    const int k8 = 8 * (lane >> 4);
+    const v2i z2 = {0, 0};
+    const v8f z8 = {0, 0, 0, 0, 0, 0, 0, 0};
+    v8f c[4][2];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 2; ++j) c[i][j] = z8;
+    const int lr = tid >> 1, lk = (tid & 1) * 8;
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        const int gr0 = t0 + lr;
+        const v2i a0 = (gr0 < T) ? ld8(X + (size_t) gr0 * K + k0 + lk) : z2;
+        *reinterpret_cast<v2i*>(As + lr * 16 + lk) = a0;
+        const int gr1 = t0 + 64 + lr;
+        const v2i a1 = (gr1 < T) ? ld8(X + (size_t) gr1 * K + k0 + lk) : z2;
+        *reinterpret_cast<v2i*>(As + (64 + lr) * 16 + lk) = a1;
+        const int gc = n0 + lr;
+        const v2i bv = (gc < N) ? ld8(W + (size_t) gc * K + k0 + lk) : z2;
+        *reinterpret_cast<v2i*>(Bs + (lr & 63) * 16 + lk) = bv;
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const v2i a = *reinterpret_cast<const v2i*>(As + (arow + 16 * i) * 16 + k8);
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const v2i b = *reinterpret_cast<const v2i*>(Bs + (brow + 16 * j) * 16 + k8);
+                c[i][j] = wmma(a, b, c[i][j]);
+            }
+        }
+        __syncthreads();
+    }
+    const int m0 = t0 + 64 * wm, n0w = n0 + 32 * wn;
+    const int col = n0w + (lane & 15);
+    for (int i = 0; i < 8; ++i) {
+        const int row = m0 + 8 * (lane >> 4) + i;
+        if (row >= T) break;
+        const float s0 = rs[row];
+        if (col >= N) continue;
+        Y[(size_t) row * ldy + col] = c[0][0][i] * s0;
+        Y[(size_t) row * ldy + col + 16] = c[0][1][i] * s0;
+        if (row + 16 < T) {
+            const float s1 = rs[row + 16];
+            Y[(size_t) (row + 16) * ldy + col] = c[1][0][i] * s1;
+            Y[(size_t) (row + 16) * ldy + col + 16] = c[1][1][i] * s1;
+        }
+        if (row + 32 < T) {
+            const float s2 = rs[row + 32];
+            Y[(size_t) (row + 32) * ldy + col] = c[2][0][i] * s2;
+            Y[(size_t) (row + 32) * ldy + col + 16] = c[2][1][i] * s2;
+        }
+        if (row + 48 < T) {
+            const float s3 = rs[row + 48];
+            Y[(size_t) (row + 48) * ldy + col] = c[3][0][i] * s3;
+            Y[(size_t) (row + 48) * ldy + col + 16] = c[3][1][i] * s3;
+        }
+    }
+}
+
 }  // namespace
 #endif
 
@@ -198,7 +351,12 @@ bool fp8_gemm(const uint8_t* X, const uint8_t* W, float* Y, int64_t T, int64_t N
     hipDeviceProp_t prop{};
     if (hipGetDeviceProperties(&prop, dev) != hipSuccess) return false;
     if (std::strncmp(prop.gcnArchName, "gfx120", 6) != 0) return false;   // FP8 WMMA is a gfx12 (RDNA4) instruction
-    if (T >= 128 && (N % 64) == 0 && (K < 2048 || T >= 256)) {   // LDS: down from T=128, up from T=256
+    static const bool lds128 = [] { const char* e = std::getenv("STRATA_FP8_LDS128"); return e != nullptr && e[0] == '1'; }();   // opt-in only: measured slower (27 vs 34 TFLOPS at T=275)
+    if (T >= 128 && (N % 64) == 0 && (K < 2048 || T >= 256) && lds128) {   // LDS128: 128x64 tiles, AI=85
+        const dim3 grid((unsigned) (N / 64), (unsigned) ((T + 127) / 128));
+        fp8_gemm_kernel_lds128<<<grid, 128, 0, (cudaStream_t) stream>>>(X, W, Y, (int) T, (int) N, (int) K, (int) ldy,
+                                                                        row_scale);
+    } else if (T >= 128 && (N % 64) == 0 && (K < 2048 || T >= 256)) {   // LDS: down from T=128, up from T=256
         const dim3 grid((unsigned) (N / 64), (unsigned) ((T + 63) / 64));
         fp8_gemm_kernel_lds<<<grid, 128, 0, (cudaStream_t) stream>>>(X, W, Y, (int) T, (int) N, (int) K, (int) ldy,
                                                                     row_scale);
@@ -209,6 +367,25 @@ bool fp8_gemm(const uint8_t* X, const uint8_t* W, float* Y, int64_t T, int64_t N
     return cudaGetLastError() == cudaSuccess;
 #else
     (void) X; (void) W; (void) Y; (void) T; (void) N; (void) K; (void) ldy; (void) row_scale; (void) stream;
+    return false;
+#endif
+}
+
+
+bool fp8_grouped_gemm(const uint8_t* X, const float* row_scale, const Fp8GroupTile* tiles, int num_tiles,
+                      void* stream) {
+#if STRATA_FP8_WMMA
+    if (num_tiles <= 0) return true;
+    if (!X || !row_scale || !tiles) return false;
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess) return false;
+    hipDeviceProp_t prop{};
+    if (hipGetDeviceProperties(&prop, dev) != hipSuccess) return false;
+    if (std::strncmp(prop.gcnArchName, "gfx120", 6) != 0) return false;
+    fp8_gemm_kernel_grouped<<<dim3((unsigned) num_tiles), 128, 0, (cudaStream_t) stream>>>(X, row_scale, tiles, num_tiles);
+    return cudaGetLastError() == cudaSuccess;
+#else
+    (void) X; (void) row_scale; (void) tiles; (void) num_tiles; (void) stream;
     return false;
 #endif
 }

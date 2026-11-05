@@ -423,7 +423,28 @@ inline int ring_slots(size_t T) {
 // The staging buffers a layout holds: the ring, and at least STAGE_GRP for the staged walk's grouped gather.  Counted
 // and taken through this one place, so the bytes the prompt path borrows cover every buffer it writes.
 inline int stage_slots(size_t T) { return std::max(ring_slots(T), STAGE_GRP); }
-constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
+constexpr int DQ = 8;              // dequantized-expert ring (FP16 gate/up + down); 8 also bounds the FP8 grouped batch
+// STRATA_MXFP4_FP8 grouped batch: up to 8 experts' tiles per launch (matches the STAGE ring and the
+// DQ ring, so no dequant slot is reused inside a batch). One device buffer (960 tiles) serves both
+// launches in turn; the host side assembles the tiles. Any miss falls back to the verified per-expert
+// fp8_gemm, so the batch only changes launch structure, never numerics.
+constexpr int FP8_GROUP_MAX = 8;          // experts per batch
+constexpr int FP8_TILE_CAP = 960;         // device tiles: 8 experts x (20 GU + 40 down) N-tiles x 2
+constexpr int64_t FP8_TILE_GU_CAP = 480;  // gate/up tiles per batch (down is exactly 2x: still fits 960)
+bool fp8_grouped_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_FP8_GROUPED");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
+void fp8_group_tiles(std::vector<Fp8GroupTile>& out, const uint8_t* w, float* y, int64_t t_start,
+                     int64_t t_count, int64_t N, int64_t K, int64_t ldy) {
+    const int64_t nN = N / 64, nM = (t_count + 255) / 256;
+    for (int64_t nt = 0; nt < nN; ++nt)
+        for (int64_t mg = 0; mg < nM; ++mg) out.push_back({w, y, t_start, t_count, nt, mg, N, K, ldy});
+}
+
 // The BF16-weight projections (hyper-connection, SSM alpha/beta, indexer, router, shared gate, PLE key/value) take
 // BF16 activations here and FP32 ones in decode. STRATA_PREFILL_BF16X2=1 adds each activation's BF16 remainder as a
 // second GEMM (Y = W.hi + W.lo, ~16 mantissa bits): a router that picks its top 10 from the same x decode would.
@@ -1159,10 +1180,72 @@ struct Prefill::Impl {
     size_t grp_n = 0, grp_tk = 0;        // int32s allocated; T_max * K (the offset of slot, and of src past it)
     uint16_t* dq_gu[DQ] = {};
     uint16_t* dq_d[DQ] = {};
+    Fp8GroupTile* d_tiles = nullptr;   // STRATA_MXFP4_FP8: the grouped GEMM's tiles on the device (960)
+    std::vector<Fp8GroupTile> tile_gu, tile_dn;   // the open batch's tiles (host-side)
+    struct Fp8BEnt { int q; int64_t o, nr; };
+    std::vector<Fp8BEnt> tile_bent;               // the open batch's entries (dequant slot, row offset, rows)
+    int tile_nexp = 0;                            // its distinct experts (a batch holds at most 8)
+    // Drain the open batch: one grouped gate/up over tile_gu, per-entry SwiGLU (+ optional Hadamard)
+    // and H quantize, then one grouped down over tile_dn. False + err only when the per-expert fallback
+    // itself cannot launch. Stream-ordered on cs.
+    bool flush_fp8_grouped(int64_t N, cudaStream_t cs, std::string& err,
+                           bool had_d, int had_block, const float* had_sh) {
+        if (tile_bent.empty()) return true;
+        if (tile_gu.capacity() < (size_t) FP8_TILE_CAP) {
+            tile_gu.reserve(FP8_TILE_CAP); tile_dn.reserve(FP8_TILE_CAP); tile_bent.reserve(64);
+        }
+        bool ok = false;
+        // (tile_gu never exceeds the device buffer: giant single entries bypass the batch at the append site)
+        if (fp8_grouped_on() && d_tiles != nullptr && tile_gu.size() <= (size_t) FP8_TILE_CAP) {
+            cudaMemcpyAsync(d_tiles, tile_gu.data(), tile_gu.size() * sizeof(Fp8GroupTile),
+                            cudaMemcpyHostToDevice, cs);
+            ok = fp8_grouped_gemm(x8, x8s, d_tiles, (int) tile_gu.size(), cs);
+        }
+        if (!ok) {   // fallback: the verified per-expert path (also when grouped is switched off)
+            for (const auto& be : tile_bent) {
+                if (!fp8_gemm(x8 + be.o * N, (const uint8_t*) dq_gu[be.q], GU + be.o * 1280, be.nr,
+                              1280, N, 1280, x8s + be.o, cs)) {
+                    err = "prefill: the MXFP4 FP8 gate/up GEMM did not launch";
+                    return false;
+                }
+            }
+        }
+        tile_dn.clear();
+        for (const auto& be : tile_bent) {
+            swiglu_interleaved(GU + be.o * 1280, Hh + be.o * 640, be.nr, cs);
+            if (had_d) strata::kernels::hadamard_rows_f16(Hh + be.o * 640, be.nr, 640, had_block, had_sh, cs);
+            strata::kernels::quantize_fp8_rows(Hh + be.o * 640, be.nr, 640, h8 + be.o * 640, h8s + be.o, cs);
+            fp8_group_tiles(tile_dn, (const uint8_t*) dq_d[be.q], Dm + be.o * N, be.o, be.nr, N, 640, N);
+        }
+        ok = false;
+        if (fp8_grouped_on() && d_tiles != nullptr && tile_dn.size() <= (size_t) FP8_TILE_CAP) {
+            cudaMemcpyAsync(d_tiles, tile_dn.data(), tile_dn.size() * sizeof(Fp8GroupTile),
+                            cudaMemcpyHostToDevice, cs);
+            ok = fp8_grouped_gemm(h8, h8s, d_tiles, (int) tile_dn.size(), cs);
+        }
+        if (!ok) {
+            for (const auto& be : tile_bent) {
+                if (!fp8_gemm(h8 + be.o * 640, (const uint8_t*) dq_d[be.q], Dm + be.o * N, be.nr, N, 640,
+                              N, h8s + be.o, cs)) {
+                    err = "prefill: the MXFP4 FP8 down GEMM did not launch";
+                    return false;
+                }
+            }
+        }
+        tile_bent.clear();
+        tile_gu.clear();
+        tile_dn.clear();
+        tile_nexp = 0;
+        return true;
+    }
     uint8_t* x8 = nullptr;      // STRATA_MXFP4_FP8: the chunk's E4M3 activations and H, with a scale per row
     uint8_t* h8 = nullptr;
     float* x8s = nullptr;
     float* h8s = nullptr;
+    uint8_t* x8c = nullptr;    // quantize-once: the chunk's T rows from mixed_h, E4M3 + one scale per row
+    float* x8cs = nullptr;
+    int64_t x8c_tag = 0;       // bumped per (chunk, layer) at routing; x8c valid iff x8c_done == x8c_tag
+    int64_t x8c_done = -1;
     uint8_t* stage_dev[RING_MAX] = {};
     int ring = STAGE;                        // the slots of this layout's ring (ring_slots)
     // THE PROMPT ROOM's resolved counts for this layout (carve): the rule's ring, the room's first slot (past the
@@ -1376,6 +1459,7 @@ void Prefill::release() {
 namespace {
 constexpr int64_t GEMM_SCRATCH = 32ll << 20;        // FP16 elements for the largest dequantized dense weight
 constexpr size_t GEMM_WS = 32u << 20;               // cuBLAS workspace
+
 
 // THE ATTENTION HALF AND THE MoE HALF SHARE THEIR BUFFERS.  A layer runs its attention (GDN or QSA), writes it back
 // into the residual, and only then its MoE, so the three sets of scratch are never live at once: one region the size
@@ -2016,11 +2100,15 @@ bool Prefill::carve(size_t T, void* alloc) {
         if (base == nullptr) ok = false;
     }
     for (int i = 0; i < DQ; ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640, ok); }
-    if (mx_fp8_on()) {   // the FP8 prompt path: T*N and T*640 bytes, and a scale per row
-        m.x8 = o.take<uint8_t>((size_t) T * N, ok);
-        m.h8 = o.take<uint8_t>((size_t) T * 640, ok);
-        m.x8s = o.take<float>((size_t) T, ok);
-        m.h8s = o.take<float>((size_t) T, ok);
+    if (mx_fp8_on()) {   // the FP8 prompt path: T*K expert rows of activations and H (expert-row
+        // offsets span T*K, like Xs/GU/Dm), and a scale per row
+        m.x8 = o.take<uint8_t>((size_t) T * K * N, ok);
+        m.h8 = o.take<uint8_t>((size_t) T * K * 640, ok);
+        m.x8s = o.take<float>((size_t) T * K, ok);
+        m.x8c = o.take<uint8_t>((size_t) T * N, ok);
+        m.x8cs = o.take<float>((size_t) T, ok);
+        m.h8s = o.take<float>((size_t) T * K, ok);
+        m.d_tiles = o.take<Fp8GroupTile>(960, ok);
     }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
@@ -2815,8 +2903,10 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
                                        moe_set_bytes(T, g.n_expert, fused_layout(T, src)),
                                        hcr ? hc_set_bytes(T, f16_io) : (uint64_t) 0}), ok);
     for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
-    if (mx_fp8_on()) {   // STRATA_MXFP4_FP8: the FP8 activations, H and their per-row scales
-        o.take<uint8_t>(T * N, ok); o.take<uint8_t>(T * 640, ok); o.take<float>(T, ok); o.take<float>(T, ok);
+    if (mx_fp8_on()) {   // STRATA_MXFP4_FP8: the FP8 activations, H and their per-row scales (T*K expert rows)
+        o.take<uint8_t>(T * K * N, ok); o.take<uint8_t>(T * K * 640, ok); o.take<float>(T * K, ok); o.take<float>(T * K, ok);
+        o.take<Fp8GroupTile>(960, ok);
+        o.take<uint8_t>(T * N, ok); o.take<float>(T, ok);   // quantize-once: x8c/x8cs
     }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
@@ -4882,6 +4972,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             for (int32_t e = 0; e < m.g->n_expert && !on_cpu.empty(); ++e)   // the CPU's block, last
                                 if (on_cpu[(size_t) e]) { m.off[(size_t) e] = r; r += m.cnt[(size_t) e]; }
                             m.off[(size_t) m.g->n_expert] = r;
+                            ++m.x8c_tag;   // quantize-once: this (chunk, layer)'s x8c is stale from here on
                             rows_local -= rows_cpu;
                         }
                         std::vector<int32_t> fill(m.off.begin(), m.off.end() - 1);
@@ -5817,18 +5908,62 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             if (slot >= 0) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
                             const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
-                            pt.mark(kPfGemmGU, cs);
                             if (fp8) {
-                                strata::kernels::quantize_fp8_rows(m.Xs + o0 * N, ne, N, m.x8, m.x8s, m.cs);
-                                if (!strata::prefill::fp8_gemm(m.x8, (const uint8_t*) m.dq_gu[q], m.GU + o0 * 1280, ne, 1280,
-                                                               N, 1280, m.x8s, m.cs)) {
-                                    err = "prefill: the MXFP4 FP8 gate/up GEMM did not launch";
-                                    return false;
+                                // Grouped batch: the dequant above stays per expert; its GEMMs join the open
+                                // batch (flushed at 8 experts, on tile overflow, or at the walk's end below).
+                                const int64_t need = (int64_t) 20 * ((ne + 255) / 256);
+                                if (need > FP8_TILE_CAP) {
+                                    // One expert alone exceeds the device tile buffer: run it per-expert
+                                    // immediately (same stream order), outside the batch.
+                                    pt.mark(kPfGemmGU, cs);
+                                    strata::kernels::quantize_fp8_rows(m.Xs + o0 * N, ne, N, m.x8 + o0 * N, m.x8s + o0, m.cs);
+                                    if (!strata::prefill::fp8_gemm(m.x8 + o0 * N, (const uint8_t*) m.dq_gu[q], m.GU + o0 * 1280, ne, 1280,
+                                                                   N, 1280, m.x8s + o0, m.cs)) {
+                                        err = "prefill: the MXFP4 FP8 gate/up GEMM did not launch";
+                                        return false;
+                                    }
+                                    swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
+                                    if (had_d) strata::kernels::hadamard_rows_f16(m.Hh + o0 * 640, ne, 640, had_block, had_sh, m.cs);
+                                    pt.mark(kPfGemmD, cs);
+                                    strata::kernels::quantize_fp8_rows(m.Hh + o0 * 640, ne, 640, m.h8 + o0 * 640, m.h8s + o0, m.cs);
+                                    if (!strata::prefill::fp8_gemm(m.h8 + o0 * 640, (const uint8_t*) m.dq_d[q], m.Dm + o0 * N, ne, N, 640,
+                                                                   N, m.h8s + o0, m.cs)) {
+                                        err = "prefill: the MXFP4 FP8 down GEMM did not launch";
+                                        return false;
+                                    }
+                                } else {
+                                    if (m.tile_nexp >= FP8_GROUP_MAX ||
+                                        m.tile_gu.size() + (size_t) need > (size_t) FP8_TILE_GU_CAP) {
+                                        pt.mark(kPfGemmGU, cs);
+                                        if (!m.flush_fp8_grouped(N, m.cs, err, had_d, had_block, had_sh)) return false;
+                                    }
+                                    // Quantize-once: the first batched expert of this (chunk, layer)
+                                    // quantizes the chunk's T rows from mixed_h into x8c/x8cs and gathers
+                                    // the whole [0, T*K) range into x8/x8s; every expert's GEMM then reads
+                                    // its slice. Falls back to the per-expert quantize on Hadamard-folded packs.
+                                    const bool qonce_ok =
+                                        m.x8c != nullptr && m.x8cs != nullptr &&
+                                        m.mixed_h != nullptr && m.src_dev != nullptr &&
+                                        (size_t) l < m.had_sx.size() && m.had_sx[(size_t) l] == nullptr;
+                                    if (qonce_ok) {
+                                        if (m.x8c_done != m.x8c_tag) {
+                                            strata::kernels::quantize_fp8_rows(m.mixed_h, T, N, m.x8c, m.x8cs, m.cs);
+                                            gather_x8c_full(m.x8c, m.x8cs, m.src_dev, T * K, N, m.x8, m.x8s, m.cs);
+                                            m.x8c_done = m.x8c_tag;
+                                        }
+                                    } else {
+                                        strata::kernels::quantize_fp8_rows(m.Xs + o0 * N, ne, N, m.x8 + o0 * N, m.x8s + o0, m.cs);
+                                    }
+                                    fp8_group_tiles(m.tile_gu, (const uint8_t*) m.dq_gu[q], m.GU + o0 * 1280, o0, ne,
+                                                    1280, N, 1280);
+                                    m.tile_bent.push_back({q, o0, ne});
+                                    ++m.tile_nexp;
                                 }
                             } else {
+                                pt.mark(kPfGemmGU, cs);
                                 m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N);
+                                swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
                             }
-                            swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
                             // APR, deliberately in place on the fp16 H: hadamard_rows_f16 reads fp16, runs the
                             // butterflies in fp32 and rounds once on the store, so against an fp32 rotation the only
                             // extra error is the one fp16 rounding of the SwiGLU output before it (~2^-11 relative per
@@ -5837,18 +5972,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             // of types and builds without MMQ (the MMQ path rotates fp32 H).  native_expert_parity
                             // bounds the fp16 rotation against the float one at relative L1 error < 2e-3.  The
                             // gate/up input (Xs above) is handled the same way.
-                            if (had_d) strata::kernels::hadamard_rows_f16(m.Hh + o0 * 640, ne, 640, had_block, had_sh, m.cs);
-                            pt.mark(kPfGemmD, cs);
-                            if (fp8) {
-                                strata::kernels::quantize_fp8_rows(m.Hh + o0 * 640, ne, 640, m.h8, m.h8s, m.cs);
-                                if (!strata::prefill::fp8_gemm(m.h8, (const uint8_t*) m.dq_d[q], m.Dm + o0 * N, ne, N, 640,
-                                                               N, m.h8s, m.cs)) {
-                                    err = "prefill: the MXFP4 FP8 down GEMM did not launch";
-                                    return false;
-                                }
-                            } else {
+                            if (!fp8) {
+                                if (had_d) strata::kernels::hadamard_rows_f16(m.Hh + o0 * 640, ne, 640, had_block, had_sh, m.cs);
+                                pt.mark(kPfGemmD, cs);
                                 m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
                             }
+                            // (fp8: SwiGLU, the H quantize and the down GEMM run in the batch flush)
                             return true;
                         };
                         if (ws_layer) {
@@ -5892,6 +6021,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     --pending;   // compute recorded the slot's release event before any reuse
                                 }
                             }
+                            if (!m.tile_bent.empty()) {   // FP8 grouped: drain the walk's tail
+                                pt.mark(kPfGemmGU, cs);
+                                if (!m.flush_fp8_grouped(N, m.cs, err, had_d, had_block, had_sh)) return false;
+                            }
                         } else {
                             // the streamed walk: this layer's entries [k, kend) in id order; an entry the routing did not
                             // pick only gives its slot back
@@ -5932,6 +6065,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 }
                             }
                             release_to(m.g->n_expert);
+                            if (!m.tile_bent.empty()) {   // FP8 grouped: drain the walk's tail
+                                pt.mark(kPfGemmGU, cs);
+                                if (!m.flush_fp8_grouped(N, m.cs, err, had_d, had_block, had_sh)) return false;
+                            }
                         }
                     }
                     pt.mark(kPfCombine, cs);
@@ -7089,30 +7226,51 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                 // this entry's rows (group-relative offset o): FP16 inputs, gate/up, SwiGLU, down
                 const int64_t o = ents[j].r0 - gp.r0, nr = ents[j].nr;
                 gather_rows16(lb.mixed_h, d_row_tok + ents[j].r0, m.Xs + o * N, nr, N, cs);
-                pt.mark(kPfGemmGU, cs);
                 if (fp8) {
-                    strata::kernels::quantize_fp8_rows(m.Xs + o * N, nr, N, m.x8, m.x8s, cs);
-                    if (!strata::prefill::fp8_gemm(m.x8, (const uint8_t*) m.dq_gu[dq], m.GU + o * 1280, nr, 1280, N,
-                                                   1280, m.x8s, cs)) {
-                        err = "prefill: the MXFP4 FP8 gate/up GEMM did not launch";
-                        return false;
+                    // Grouped batch: the dequant above stays per expert; its GEMMs join the open batch.
+                    // Flush at 8 experts, on tile overflow, or at the group end below (the combine reads Dm).
+                    const bool new_exp = (j == 0 || ents[j - 1].e != e);
+                    const int64_t need = (int64_t) 20 * ((nr + 255) / 256);
+                    if (need > FP8_TILE_CAP) {
+                        // One entry alone exceeds the device tile buffer: run it per-expert immediately.
+                        pt.mark(kPfGemmGU, cs);
+                        strata::kernels::quantize_fp8_rows(m.Xs + o * N, nr, N, m.x8 + o * N, m.x8s + o, cs);
+                        if (!strata::prefill::fp8_gemm(m.x8 + o * N, (const uint8_t*) m.dq_gu[dq], m.GU + o * 1280, nr, 1280, N,
+                                                       1280, m.x8s + o, cs)) {
+                            err = "prefill: the MXFP4 FP8 gate/up GEMM did not launch";
+                            return false;
+                        }
+                        swiglu_interleaved(m.GU + o * 1280, m.Hh + o * 640, nr, cs);
+                        pt.mark(kPfGemmD, cs);
+                        strata::kernels::quantize_fp8_rows(m.Hh + o * 640, nr, 640, m.h8 + o * 640, m.h8s + o, cs);
+                        if (!strata::prefill::fp8_gemm(m.h8 + o * 640, (const uint8_t*) m.dq_d[dq], m.Dm + o * N, nr, N, 640,
+                                                       N, m.h8s + o, cs)) {
+                            err = "prefill: the MXFP4 FP8 down GEMM did not launch";
+                            return false;
+                        }
+                    } else {
+                        if ((new_exp && m.tile_nexp >= FP8_GROUP_MAX) ||
+                            m.tile_gu.size() + (size_t) need > (size_t) FP8_TILE_GU_CAP) {
+                            pt.mark(kPfGemmGU, cs);
+                            if (!m.flush_fp8_grouped(N, cs, err, false, 0, nullptr)) return false;
+                        }
+                        strata::kernels::quantize_fp8_rows(m.Xs + o * N, nr, N, m.x8 + o * N, m.x8s + o, cs);
+                        fp8_group_tiles(m.tile_gu, (const uint8_t*) m.dq_gu[dq], m.GU + o * 1280, o, nr, 1280, N, 1280);
+                        m.tile_bent.push_back({dq, o, nr});
+                        if (new_exp || m.tile_bent.size() == 1) ++m.tile_nexp;
                     }
                 } else {
+                    pt.mark(kPfGemmGU, cs);
                     m.gemm.f16(m.Xs + o * N, m.dq_gu[dq], m.GU + o * 1280, nr, 1280, N);
-                }
-                swiglu_interleaved(m.GU + o * 1280, m.Hh + o * 640, nr, cs);
-                pt.mark(kPfGemmD, cs);
-                if (fp8) {
-                    strata::kernels::quantize_fp8_rows(m.Hh + o * 640, nr, 640, m.h8, m.h8s, cs);
-                    if (!strata::prefill::fp8_gemm(m.h8, (const uint8_t*) m.dq_d[dq], m.Dm + o * N, nr, N, 640,
-                                                   N, m.h8s, cs)) {
-                        err = "prefill: the MXFP4 FP8 down GEMM did not launch";
-                        return false;
-                    }
-                } else {
+                    swiglu_interleaved(m.GU + o * 1280, m.Hh + o * 640, nr, cs);
+                    pt.mark(kPfGemmD, cs);
                     m.gemm.f16(m.Hh + o * 640, m.dq_d[dq], m.Dm + o * N, nr, N, 640);
                 }
                 if (j + 1 < gp.j1) continue;
+                if (fp8) {   // drain the batch before the group's combine reads Dm
+                    pt.mark(kPfGemmGU, cs);
+                    if (!m.flush_fp8_grouped(N, cs, err, false, 0, nullptr)) return false;
+                }
                 pt.mark(kPfCombine, cs);
                 moe_scatter_add(m.Dm, d_u_tok + gp.u_at, d_u_off + gp.uo_at, d_u_rows + gp.r0,
                                 d_u_w + gp.r0, gp.nu, lb.acc, cs);
