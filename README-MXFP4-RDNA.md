@@ -118,3 +118,35 @@ running. The launcher sets `STRATA_MXFP4_FP8=1` and the config uses
 - Fork of [Niko1221/Strata](https://github.com/Niko1221/Strata).
 - Upstream base: 0.2.10 + PR #3575.
 - Unrelated to gufo, MBufo, and halogen.
+
+## Decode (MTP, 2026-11-06)
+
+`configs/mxfp4-rdna-mtp.json` (launcher: `./serve-mxfp4-rdna-mtp.sh`) trades a
+little prefill scheduling freedom for decode: `--spec 2 --spec-min-p 0.5` (small
+window, high gate) plus `--mtp-hnorm stream` lift the MTP acceptance from 14.5%
+to 72.6% on prose and 25.1% to 83.0% on code.
+
+The second lever is the expert cache, and it is **not** the ranking in
+`--expert-profile`: the adaptive tier swaps the truly hot experts into VRAM
+anyway. `--expert-profile-save` persists what it learned (every 10 min and on
+QUIT), so the next cold start begins at the converged set. The profile shipped
+in `data/expert-profile.bin` is such a saved profile.
+
+Cold-start decode (first request after a restart, greedy, 200 tokens), measured
+with `tools/strata_bench.py`'s prompt set on the RX 9070:
+
+| variant | code tok/s | prose tok/s |
+|---|---:|---:|
+| shipped / freshly built profile | 28.9 | 34.7 |
+| trace-ranked "code-heavy" profile | 37.2 | 35.2 |
+| **learned profile (`--expert-profile-save`)** | **39.5** | **36.6** |
+
+Warm requests reach 41-44 tok/s on code. Two notes from the same sweep:
+`--expert-cache-per-layer` changes nothing when a profile already spreads the
+slots across layers, and `--mtp-q4 all` costs 6 points of acceptance without
+saving VRAM. `--pool-workers 20` (20 cores: 8 P + 12 E on the Core Ultra 7 265K)
+drops decode by 35% - keep 13.
+
+The decode-side GPU hit rate is a misleading target: the learned profile runs at
+56% hits and is faster than a 67%-hit trace-ranked profile, because misses drain
+to the CPU pool and overlap with the serialized GPU hit path.
