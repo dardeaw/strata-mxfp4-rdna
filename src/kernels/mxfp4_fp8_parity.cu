@@ -188,10 +188,19 @@ void bench_gemm(int T, int N, int K, int reps) {
     CHECK(hipMemcpy(dR, rs.data(), T * sizeof(float), hipMemcpyHostToDevice) == hipSuccess, "bench rs upload");
     for (int i = 0; i < 3; ++i) strata::prefill::fp8_gemm(dX, dW, dY, T, N, K, N, dR, nullptr);
     CHECK(hipDeviceSynchronize() == hipSuccess, "bench warmup sync");
+    // STRATA_BENCH_COLD=1: evict the L2 (256MB trash memset) before every rep, so W/X read
+    // cold like the end-to-end path (fresh dequant writes per expert per layer) instead of L2-hot.
+    const bool cold = std::getenv("STRATA_BENCH_COLD") != nullptr;
+    uint8_t* trash = nullptr;
+    if (cold) CHECK(hipMalloc((void**) &trash, 96ull << 20) == hipSuccess, "bench trash alloc");
     hipEvent_t a, b;
     hipEventCreate(&a); hipEventCreate(&b);
     hipEventRecord(a);
-    for (int i = 0; i < reps; ++i) strata::prefill::fp8_gemm(dX, dW, dY, T, N, K, N, dR, nullptr);
+    for (int i = 0; i < reps; ++i) {
+        if (cold) CHECK(hipMemset(trash, i & 0xff, 96ull << 20) == hipSuccess, "bench trash evict");
+        strata::prefill::fp8_gemm(dX, dW, dY, T, N, K, N, dR, nullptr);
+    }
+    if (trash) CHECK(hipFree(trash) == hipSuccess, "bench trash free");
     hipEventRecord(b);
     CHECK(hipEventSynchronize(b) == hipSuccess, "bench sync");
     float ms = 0;
@@ -608,6 +617,17 @@ int main() {
     bench_gemm(128, 1280, 2560, 20);
     bench_gemm(256, 1280, 2560, 10);
     bench_gemm(128, 2560, 640, 20);
+    bench_gemm(512, 2560, 1280, 10);     // R2 sweep: gate, large T
+    bench_gemm(1024, 2560, 1280, 10);
+    bench_gemm(2048, 2560, 1280, 10);
+    bench_gemm(4096, 2560, 1280, 5);
+    bench_gemm(512, 640, 2560, 10);      // R2 sweep: up, large T
+    bench_gemm(1024, 640, 2560, 10);
+    bench_gemm(2048, 640, 2560, 10);
+    bench_gemm(512, 2560, 640, 10);      // R2 sweep: down, large T
+    bench_gemm(1024, 2560, 640, 10);
+    bench_gemm(2048, 2560, 640, 10);
+    bench_gemm(4096, 2560, 640, 5);
     if (failures != 0) {
         std::printf("FAILED: %d checks\n", failures);
         return 1;

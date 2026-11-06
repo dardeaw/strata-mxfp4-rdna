@@ -45,6 +45,7 @@ void iq_dequant_gu_f16(int ggml_type, const void* gate, const void* up, int64_t 
 void iq_dequant_gu_mxfp4_fp8(int ggml_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd,
                              uint8_t* dst, void* stream);
 void iq_dequant_mxfp4_fp8(int ggml_type, const void* src, int64_t n, uint8_t* dst, void* stream);
+void fused_swiglu_quant_fp8(const float* gu, int64_t n, uint8_t* y, float* scale, void* stream);
 void quantize_fp8_rows(const void* x, int64_t rows, int64_t cols, uint8_t* y, float* scale, void* stream);
 
 /// The layout of one native expert blob: [gate rows | up rows | down rows], raw GGUF blocks.

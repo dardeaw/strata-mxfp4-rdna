@@ -423,14 +423,15 @@ inline int ring_slots(size_t T) {
 // The staging buffers a layout holds: the ring, and at least STAGE_GRP for the staged walk's grouped gather.  Counted
 // and taken through this one place, so the bytes the prompt path borrows cover every buffer it writes.
 inline int stage_slots(size_t T) { return std::max(ring_slots(T), STAGE_GRP); }
-constexpr int DQ = 8;              // dequantized-expert ring (FP16 gate/up + down); 8 also bounds the FP8 grouped batch
-// STRATA_MXFP4_FP8 grouped batch: up to 8 experts' tiles per launch (matches the STAGE ring and the
-// DQ ring, so no dequant slot is reused inside a batch). One device buffer (960 tiles) serves both
+constexpr int DQ = 16;             // dequantized-expert ring (FP16 gate/up + down); 16 also bounds the FP8 grouped batch
+// STRATA_MXFP4_FP8 grouped batch: up to 16 experts' tiles per launch (matches the STAGE ring and the
+// DQ ring, so no dequant slot is reused inside a batch). One device buffer (1920 tiles) serves both
 // launches in turn; the host side assembles the tiles. Any miss falls back to the verified per-expert
 // fp8_gemm, so the batch only changes launch structure, never numerics.
-constexpr int FP8_GROUP_MAX = 8;          // experts per batch
-constexpr int FP8_TILE_CAP = 960;         // device tiles: 8 experts x (20 GU + 40 down) N-tiles x 2
-constexpr int64_t FP8_TILE_GU_CAP = 480;  // gate/up tiles per batch (down is exactly 2x: still fits 960)
+constexpr int FP8_GROUP_MAX = 8;          // experts per batch (L2 test: 8x4.9MB=39MB fits the 64MB L2; 16x78MB thrashed it)
+constexpr int64_t FP8_SMALL_MAX = 128;        // below half an M-group: per-expert, not grouped
+constexpr int FP8_TILE_CAP = 1920;        // device tiles: 16 experts x (20 GU + 40 down) N-tiles x 2
+constexpr int64_t FP8_TILE_GU_CAP = 960;  // gate/up tiles per batch (down is exactly 2x: still fits 1920)
 bool fp8_grouped_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_FP8_GROUPED");
@@ -1073,6 +1074,52 @@ struct PrefillWarmer {
     }
 };
 
+// STRATA_PREFILL_TIMING=1: the prompt path's GPU time by phase.  Events are recorded on the compute stream in order;
+// the time between two consecutive marks is charged to the phase of the first, so a gap where the GPU waits (for the
+// host's expert grouping, or for an expert's copy) lands on the phase that was waiting.  Events are reused: the marks
+// are folded at every MoE layer's host sync, after which all of them have completed.
+enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn, kPfRouter, kPfHostGroup, kPfGather,
+               kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfKvStage, kPfGdnConv, kPfGdnRec, kPfGdnOut, kPfHcWrite,
+               kPfHcDown, kPfHcUp, kPfHcInj, kPfHcMix, kPfQsaIdxG, kPfQsaPrep,
+               kPfCount };
+const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa proj", "qsa indexer", "qsa select",
+                                        "qsa attn", "router+shared", "host grouping", "gather", "wait copy", "dequant",
+                                        "gemm gate/up", "gemm down", "combine", "ple", "kv stage", "gdn conv+gates",
+                                        "gdn recurrence", "gdn out proj", "hc write", "hc read: down+silu", "hc read: up", "hc read: inject", "hc read: mix", "qsa: indexer gemms", "qsa: norm/rope/kv append/q prep"};
+struct PfTimer {
+    bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
+    std::vector<cudaEvent_t> ev;
+    std::vector<int> ph;
+    size_t used = 0;
+    double ms[kPfCount] = {};
+    void mark(int phase, cudaStream_t s) {
+        if (!on) return;
+        if (used == ev.size()) {
+            cudaEvent_t e = nullptr;
+            cudaEventCreate(&e);
+            ev.push_back(e);
+            ph.push_back(0);
+        }
+        ph[used] = phase;
+        cudaEventRecord(ev[used], s);
+        ++used;
+    }
+    // every recorded mark has completed (the stream was synchronized): charge the gaps, keep the last mark
+    void fold() {
+        if (!on || used < 2) return;
+        for (size_t i = 0; i + 1 < used; ++i) {
+            float t = 0.0f;
+            if (cudaEventElapsedTime(&t, ev[i], ev[i + 1]) == cudaSuccess) ms[ph[i]] += t;
+        }
+        std::swap(ev[0], ev[used - 1]);
+        std::swap(ph[0], ph[used - 1]);
+        used = 1;
+    }
+    ~PfTimer() {
+        for (cudaEvent_t e : ev) cudaEventDestroy(e);
+    }
+};
+
 struct Prefill::Impl {
     const core::WeightTable* wt = nullptr;
     const core::ModelGeometry* g = nullptr;
@@ -1180,23 +1227,43 @@ struct Prefill::Impl {
     size_t grp_n = 0, grp_tk = 0;        // int32s allocated; T_max * K (the offset of slot, and of src past it)
     uint16_t* dq_gu[DQ] = {};
     uint16_t* dq_d[DQ] = {};
-    Fp8GroupTile* d_tiles = nullptr;   // STRATA_MXFP4_FP8: the grouped GEMM's tiles on the device (960)
+    Fp8GroupTile* d_tiles = nullptr;   // STRATA_MXFP4_FP8: the grouped GEMM's tiles on the device (1920)
     std::vector<Fp8GroupTile> tile_gu, tile_dn;   // the open batch's tiles (host-side)
-    struct Fp8BEnt { int q; int64_t o, nr; };
+    struct Fp8BEnt { int q; int64_t o, nr; bool small; };
     std::vector<Fp8BEnt> tile_bent;               // the open batch's entries (dequant slot, row offset, rows)
-    int tile_nexp = 0;                            // its distinct experts (a batch holds at most 8)
+    int tile_nexp = 0;                            // its distinct experts (a batch holds at most 16)
     // Drain the open batch: one grouped gate/up over tile_gu, per-entry SwiGLU (+ optional Hadamard)
     // and H quantize, then one grouped down over tile_dn. False + err only when the per-expert fallback
     // itself cannot launch. Stream-ordered on cs.
     bool flush_fp8_grouped(int64_t N, cudaStream_t cs, std::string& err,
-                           bool had_d, int had_block, const float* had_sh) {
+                           bool had_d, int had_block, const float* had_sh,
+                           PfTimer* ptm = nullptr) {
         if (tile_bent.empty()) return true;
+        {   // R2b census: one line per flush when STRATA_FP8_SHAPELOG=1 (timing-only, zero cost otherwise)
+            static const bool shapelog = std::getenv("STRATA_FP8_SHAPELOG") != nullptr;
+            if (shapelog) {
+                int64_t ttot = 0, nrmin = INT64_MAX, nrmax = 0;
+                int nsmall = 0;
+                for (const auto& be : tile_bent) {
+                    ttot += be.nr;
+                    if (be.nr < nrmin) nrmin = be.nr;
+                    if (be.nr > nrmax) nrmax = be.nr;
+                    if (be.nr < 64) ++nsmall;
+                }
+                std::fprintf(stderr, "fp8shape T=%lld E=%d nrmin=%lld nrmax=%lld nsmall=%d\n",
+                             (long long) ttot, tile_nexp, (long long) nrmin, (long long) nrmax, nsmall);
+            }
+        }
         if (tile_gu.capacity() < (size_t) FP8_TILE_CAP) {
             tile_gu.reserve(FP8_TILE_CAP); tile_dn.reserve(FP8_TILE_CAP); tile_bent.reserve(64);
         }
+        // small experts (< half an M-group) run the verified per-expert kernel: inside the 256-row
+        // grouped tiles each would burn a full K-loop for a handful of rows.
+        bool have_big = false;
+        for (const auto& be : tile_bent) { if (!be.small) { have_big = true; break; } }
         bool ok = false;
-        // (tile_gu never exceeds the device buffer: giant single entries bypass the batch at the append site)
-        if (fp8_grouped_on() && d_tiles != nullptr && tile_gu.size() <= (size_t) FP8_TILE_CAP) {
+        // (tile_gu holds big experts only now; giant single entries bypass the batch at the append site)
+        if (have_big && fp8_grouped_on() && d_tiles != nullptr && tile_gu.size() <= (size_t) FP8_TILE_CAP) {
             cudaMemcpyAsync(d_tiles, tile_gu.data(), tile_gu.size() * sizeof(Fp8GroupTile),
                             cudaMemcpyHostToDevice, cs);
             ok = fp8_grouped_gemm(x8, x8s, d_tiles, (int) tile_gu.size(), cs);
@@ -1209,24 +1276,44 @@ struct Prefill::Impl {
                     return false;
                 }
             }
+        } else {
+            for (const auto& be : tile_bent) {
+                if (be.small && !fp8_gemm(x8 + be.o * N, (const uint8_t*) dq_gu[be.q], GU + be.o * 1280, be.nr,
+                                          1280, N, 1280, x8s + be.o, cs)) {
+                    err = "prefill: the MXFP4 FP8 gate/up GEMM did not launch";
+                    return false;
+                }
+            }
         }
         tile_dn.clear();
         for (const auto& be : tile_bent) {
-            swiglu_interleaved(GU + be.o * 1280, Hh + be.o * 640, be.nr, cs);
-            if (had_d) strata::kernels::hadamard_rows_f16(Hh + be.o * 640, be.nr, 640, had_block, had_sh, cs);
-            strata::kernels::quantize_fp8_rows(Hh + be.o * 640, be.nr, 640, h8 + be.o * 640, h8s + be.o, cs);
-            fp8_group_tiles(tile_dn, (const uint8_t*) dq_d[be.q], Dm + be.o * N, be.o, be.nr, N, 640, N);
+            if (!had_d) strata::kernels::fused_swiglu_quant_fp8(GU + be.o * 1280, be.nr, h8 + be.o * 640, h8s + be.o, cs);
+            else {
+                swiglu_interleaved(GU + be.o * 1280, Hh + be.o * 640, be.nr, cs);
+                strata::kernels::hadamard_rows_f16(Hh + be.o * 640, be.nr, 640, had_block, had_sh, cs);
+                strata::kernels::quantize_fp8_rows(Hh + be.o * 640, be.nr, 640, h8 + be.o * 640, h8s + be.o, cs);
+            }
+            if (!be.small) fp8_group_tiles(tile_dn, (const uint8_t*) dq_d[be.q], Dm + be.o * N, be.o, be.nr, N, 640, N);
+        }
+        if (ptm) ptm->mark(kPfGemmD, cs);
+        // small experts' down runs per-expert here, right after their H quantize above
+        for (const auto& be : tile_bent) {
+            if (be.small && !fp8_gemm(h8 + be.o * 640, (const uint8_t*) dq_d[be.q], Dm + be.o * N, be.nr, N, 640,
+                                      N, h8s + be.o, cs)) {
+                err = "prefill: the MXFP4 FP8 down GEMM did not launch";
+                return false;
+            }
         }
         ok = false;
-        if (fp8_grouped_on() && d_tiles != nullptr && tile_dn.size() <= (size_t) FP8_TILE_CAP) {
+        if (have_big && fp8_grouped_on() && d_tiles != nullptr && tile_dn.size() <= (size_t) FP8_TILE_CAP) {
             cudaMemcpyAsync(d_tiles, tile_dn.data(), tile_dn.size() * sizeof(Fp8GroupTile),
                             cudaMemcpyHostToDevice, cs);
             ok = fp8_grouped_gemm(h8, h8s, d_tiles, (int) tile_dn.size(), cs);
         }
         if (!ok) {
             for (const auto& be : tile_bent) {
-                if (!fp8_gemm(h8 + be.o * 640, (const uint8_t*) dq_d[be.q], Dm + be.o * N, be.nr, N, 640,
-                              N, h8s + be.o, cs)) {
+                if (!be.small && !fp8_gemm(h8 + be.o * 640, (const uint8_t*) dq_d[be.q], Dm + be.o * N, be.nr, N, 640,
+                                           N, h8s + be.o, cs)) {
                     err = "prefill: the MXFP4 FP8 down GEMM did not launch";
                     return false;
                 }
@@ -2108,7 +2195,7 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.x8c = o.take<uint8_t>((size_t) T * N, ok);
         m.x8cs = o.take<float>((size_t) T, ok);
         m.h8s = o.take<float>((size_t) T * K, ok);
-        m.d_tiles = o.take<Fp8GroupTile>(960, ok);
+        m.d_tiles = o.take<Fp8GroupTile>((size_t) FP8_TILE_CAP, ok);
     }
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
@@ -2905,7 +2992,7 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
     if (mx_fp8_on()) {   // STRATA_MXFP4_FP8: the FP8 activations, H and their per-row scales (T*K expert rows)
         o.take<uint8_t>(T * K * N, ok); o.take<uint8_t>(T * K * 640, ok); o.take<float>(T * K, ok); o.take<float>(T * K, ok);
-        o.take<Fp8GroupTile>(960, ok);
+        o.take<Fp8GroupTile>((size_t) FP8_TILE_CAP, ok);
         o.take<uint8_t>(T * N, ok); o.take<float>(T, ok);   // quantize-once: x8c/x8cs
     }
     if (mmq_plan().any) {
@@ -3080,51 +3167,6 @@ bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, 
 }  // namespace
 
 namespace {
-// STRATA_PREFILL_TIMING=1: the prompt path's GPU time by phase.  Events are recorded on the compute stream in order;
-// the time between two consecutive marks is charged to the phase of the first, so a gap where the GPU waits (for the
-// host's expert grouping, or for an expert's copy) lands on the phase that was waiting.  Events are reused: the marks
-// are folded at every MoE layer's host sync, after which all of them have completed.
-enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn, kPfRouter, kPfHostGroup, kPfGather,
-               kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfKvStage, kPfGdnConv, kPfGdnRec, kPfGdnOut, kPfHcWrite,
-               kPfHcDown, kPfHcUp, kPfHcInj, kPfHcMix, kPfQsaIdxG, kPfQsaPrep,
-               kPfCount };
-const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa proj", "qsa indexer", "qsa select",
-                                        "qsa attn", "router+shared", "host grouping", "gather", "wait copy", "dequant",
-                                        "gemm gate/up", "gemm down", "combine", "ple", "kv stage", "gdn conv+gates",
-                                        "gdn recurrence", "gdn out proj", "hc write", "hc read: down+silu", "hc read: up", "hc read: inject", "hc read: mix", "qsa: indexer gemms", "qsa: norm/rope/kv append/q prep"};
-struct PfTimer {
-    bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
-    std::vector<cudaEvent_t> ev;
-    std::vector<int> ph;
-    size_t used = 0;
-    double ms[kPfCount] = {};
-    void mark(int phase, cudaStream_t s) {
-        if (!on) return;
-        if (used == ev.size()) {
-            cudaEvent_t e = nullptr;
-            cudaEventCreate(&e);
-            ev.push_back(e);
-            ph.push_back(0);
-        }
-        ph[used] = phase;
-        cudaEventRecord(ev[used], s);
-        ++used;
-    }
-    // every recorded mark has completed (the stream was synchronized): charge the gaps, keep the last mark
-    void fold() {
-        if (!on || used < 2) return;
-        for (size_t i = 0; i + 1 < used; ++i) {
-            float t = 0.0f;
-            if (cudaEventElapsedTime(&t, ev[i], ev[i + 1]) == cudaSuccess) ms[ph[i]] += t;
-        }
-        std::swap(ev[0], ev[used - 1]);
-        std::swap(ph[0], ph[used - 1]);
-        used = 1;
-    }
-    ~PfTimer() {
-        for (cudaEvent_t e : ev) cudaEventDestroy(e);
-    }
-};
 // multi-GPU: the peer's own timeline (STRATA_PREFILL_TIMING): marks on the peer stream, folded with the primary's
 enum PePhase { kPeIdle, kPeMoeIn, kPeMoeGemm, kPeMoeOut, kPeCount };
 const char* const kPeNames[kPeCount] = {"idle", "moe in", "moe gemm", "moe out"};
@@ -5922,20 +5964,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                         err = "prefill: the MXFP4 FP8 gate/up GEMM did not launch";
                                         return false;
                                     }
-                                    swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
-                                    if (had_d) strata::kernels::hadamard_rows_f16(m.Hh + o0 * 640, ne, 640, had_block, had_sh, m.cs);
+                                    if (!had_d) strata::kernels::fused_swiglu_quant_fp8(m.GU + o0 * 1280, ne, m.h8 + o0 * 640, m.h8s + o0, m.cs);
+                                    else {
+                                        swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
+                                        strata::kernels::hadamard_rows_f16(m.Hh + o0 * 640, ne, 640, had_block, had_sh, m.cs);
+                                        strata::kernels::quantize_fp8_rows(m.Hh + o0 * 640, ne, 640, m.h8 + o0 * 640, m.h8s + o0, m.cs);
+                                    }
                                     pt.mark(kPfGemmD, cs);
-                                    strata::kernels::quantize_fp8_rows(m.Hh + o0 * 640, ne, 640, m.h8 + o0 * 640, m.h8s + o0, m.cs);
                                     if (!strata::prefill::fp8_gemm(m.h8 + o0 * 640, (const uint8_t*) m.dq_d[q], m.Dm + o0 * N, ne, N, 640,
                                                                    N, m.h8s + o0, m.cs)) {
                                         err = "prefill: the MXFP4 FP8 down GEMM did not launch";
                                         return false;
                                     }
                                 } else {
+                                    const bool small = ne < FP8_SMALL_MAX;
                                     if (m.tile_nexp >= FP8_GROUP_MAX ||
-                                        m.tile_gu.size() + (size_t) need > (size_t) FP8_TILE_GU_CAP) {
+                                        (!small && m.tile_gu.size() + (size_t) need > (size_t) FP8_TILE_GU_CAP)) {
                                         pt.mark(kPfGemmGU, cs);
-                                        if (!m.flush_fp8_grouped(N, m.cs, err, had_d, had_block, had_sh)) return false;
+                                        if (!m.flush_fp8_grouped(N, m.cs, err, had_d, had_block, had_sh, &pt)) return false;
                                     }
                                     // Quantize-once: the first batched expert of this (chunk, layer)
                                     // quantizes the chunk's T rows from mixed_h into x8c/x8cs and gathers
@@ -5954,9 +6000,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     } else {
                                         strata::kernels::quantize_fp8_rows(m.Xs + o0 * N, ne, N, m.x8 + o0 * N, m.x8s + o0, m.cs);
                                     }
-                                    fp8_group_tiles(m.tile_gu, (const uint8_t*) m.dq_gu[q], m.GU + o0 * 1280, o0, ne,
-                                                    1280, N, 1280);
-                                    m.tile_bent.push_back({q, o0, ne});
+                                    if (!small) fp8_group_tiles(m.tile_gu, (const uint8_t*) m.dq_gu[q], m.GU + o0 * 1280, o0, ne,
+                                                                  1280, N, 1280);
+                                    m.tile_bent.push_back({q, o0, ne, small});
                                     ++m.tile_nexp;
                                 }
                             } else {
@@ -6023,7 +6069,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             if (!m.tile_bent.empty()) {   // FP8 grouped: drain the walk's tail
                                 pt.mark(kPfGemmGU, cs);
-                                if (!m.flush_fp8_grouped(N, m.cs, err, had_d, had_block, had_sh)) return false;
+                                if (!m.flush_fp8_grouped(N, m.cs, err, had_d, had_block, had_sh, &pt)) return false;
                             }
                         } else {
                             // the streamed walk: this layer's entries [k, kend) in id order; an entry the routing did not
@@ -6067,7 +6113,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             release_to(m.g->n_expert);
                             if (!m.tile_bent.empty()) {   // FP8 grouped: drain the walk's tail
                                 pt.mark(kPfGemmGU, cs);
-                                if (!m.flush_fp8_grouped(N, m.cs, err, had_d, had_block, had_sh)) return false;
+                                if (!m.flush_fp8_grouped(N, m.cs, err, had_d, had_block, had_sh, &pt)) return false;
                             }
                         }
                     }
@@ -7240,23 +7286,23 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                             err = "prefill: the MXFP4 FP8 gate/up GEMM did not launch";
                             return false;
                         }
-                        swiglu_interleaved(m.GU + o * 1280, m.Hh + o * 640, nr, cs);
+                        strata::kernels::fused_swiglu_quant_fp8(m.GU + o * 1280, nr, m.h8 + o * 640, m.h8s + o, cs);
                         pt.mark(kPfGemmD, cs);
-                        strata::kernels::quantize_fp8_rows(m.Hh + o * 640, nr, 640, m.h8 + o * 640, m.h8s + o, cs);
                         if (!strata::prefill::fp8_gemm(m.h8 + o * 640, (const uint8_t*) m.dq_d[dq], m.Dm + o * N, nr, N, 640,
                                                        N, m.h8s + o, cs)) {
                             err = "prefill: the MXFP4 FP8 down GEMM did not launch";
                             return false;
                         }
                     } else {
+                        const bool small = nr < FP8_SMALL_MAX;
                         if ((new_exp && m.tile_nexp >= FP8_GROUP_MAX) ||
-                            m.tile_gu.size() + (size_t) need > (size_t) FP8_TILE_GU_CAP) {
+                            (!small && m.tile_gu.size() + (size_t) need > (size_t) FP8_TILE_GU_CAP)) {
                             pt.mark(kPfGemmGU, cs);
-                            if (!m.flush_fp8_grouped(N, cs, err, false, 0, nullptr)) return false;
+                            if (!m.flush_fp8_grouped(N, cs, err, false, 0, nullptr, &pt)) return false;
                         }
                         strata::kernels::quantize_fp8_rows(m.Xs + o * N, nr, N, m.x8 + o * N, m.x8s + o, cs);
-                        fp8_group_tiles(m.tile_gu, (const uint8_t*) m.dq_gu[dq], m.GU + o * 1280, o, nr, 1280, N, 1280);
-                        m.tile_bent.push_back({dq, o, nr});
+                        if (!small) fp8_group_tiles(m.tile_gu, (const uint8_t*) m.dq_gu[dq], m.GU + o * 1280, o, nr, 1280, N, 1280);
+                        m.tile_bent.push_back({dq, o, nr, small});
                         if (new_exp || m.tile_bent.size() == 1) ++m.tile_nexp;
                     }
                 } else {
@@ -7269,7 +7315,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                 if (j + 1 < gp.j1) continue;
                 if (fp8) {   // drain the batch before the group's combine reads Dm
                     pt.mark(kPfGemmGU, cs);
-                    if (!m.flush_fp8_grouped(N, cs, err, false, 0, nullptr)) return false;
+                    if (!m.flush_fp8_grouped(N, cs, err, false, 0, nullptr, &pt)) return false;
                 }
                 pt.mark(kPfCombine, cs);
                 moe_scatter_add(m.Dm, d_u_tok + gp.u_at, d_u_off + gp.uo_at, d_u_rows + gp.r0,
