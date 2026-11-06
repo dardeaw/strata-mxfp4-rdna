@@ -218,8 +218,8 @@ __global__ void fp8_gemm_kernel_grouped(const uint8_t* __restrict__ X, const flo
 __global__ void fp8_gemm_kernel_lds(const uint8_t* __restrict__ X, const uint8_t* __restrict__ W,
                                     float* __restrict__ Y, int T, int N, int K, int ldy,
                                     const float* __restrict__ rs) {
-    __shared__ __attribute__((aligned(16))) uint8_t As[64 * 16];
-    __shared__ __attribute__((aligned(16))) uint8_t Bs[64 * 16];
+    __shared__ __attribute__((aligned(16))) uint8_t As[64 * 24];
+    __shared__ __attribute__((aligned(16))) uint8_t Bs[64 * 24];
     const int n0 = blockIdx.x * 64, t0 = blockIdx.y * 64;
     const int tid = threadIdx.x;
     const int lane = tid & 31, wave = tid >> 5;
@@ -231,15 +231,16 @@ __global__ void fp8_gemm_kernel_lds(const uint8_t* __restrict__ X, const uint8_t
     const int lr = tid >> 1, lk = (tid & 1) * 8;   // each thread stages 8 bytes of A and of B
     for (int k0 = 0; k0 < K; k0 += 16) {
         const int gr = t0 + lr, gc = n0 + lr;
-        const v2i av = (gr < T) ? ld8(X + (size_t) gr * K + k0 + lk) : z2;
-        const v2i bv = (gc < N) ? ld8(W + (size_t) gc * K + k0 + lk) : z2;
-        *reinterpret_cast<v2i*>(As + lr * 16 + lk) = av;
-        *reinterpret_cast<v2i*>(Bs + lr * 16 + lk) = bv;
+        const int grc = gr < T ? gr : T - 1, gcc = gc < N ? gc : N - 1;
+        const v2i av = ld8(X + (size_t) grc * K + k0 + lk);
+        const v2i bv = ld8(W + (size_t) gcc * K + k0 + lk);
+        *reinterpret_cast<v2i*>(As + lr * 24 + lk) = av;
+        *reinterpret_cast<v2i*>(Bs + lr * 24 + lk) = bv;
         __syncthreads();
-        const v2i a0 = *reinterpret_cast<const v2i*>(As + arow * 16 + k8);
-        const v2i a1 = *reinterpret_cast<const v2i*>(As + (arow + 16) * 16 + k8);
-        const v2i b0 = *reinterpret_cast<const v2i*>(Bs + brow * 16 + k8);
-        const v2i b1 = *reinterpret_cast<const v2i*>(Bs + (brow + 16) * 16 + k8);
+        const v2i a0 = *reinterpret_cast<const v2i*>(As + arow * 24 + k8);
+        const v2i a1 = *reinterpret_cast<const v2i*>(As + (arow + 16) * 24 + k8);
+        const v2i b0 = *reinterpret_cast<const v2i*>(Bs + brow * 24 + k8);
+        const v2i b1 = *reinterpret_cast<const v2i*>(Bs + (brow + 16) * 24 + k8);
         c00 = wmma(a0, b0, c00);
         c01 = wmma(a0, b1, c01);
         c10 = wmma(a1, b0, c10);
@@ -248,6 +249,17 @@ __global__ void fp8_gemm_kernel_lds(const uint8_t* __restrict__ X, const uint8_t
     }
     const int m0 = t0 + 32 * msub, n0w = n0 + 32 * nsub;
     const int col = n0w + (lane & 15);
+    if (t0 + 64 <= T && n0 + 64 <= N) {
+        for (int i = 0; i < 8; ++i) {
+            const int row = m0 + 8 * (lane >> 4) + i;
+            const float s0 = rs[row], s1 = rs[row + 16];
+            Y[(size_t) row * ldy + col] = c00[i] * s0;
+            Y[(size_t) row * ldy + col + 16] = c01[i] * s0;
+            Y[(size_t) (row + 16) * ldy + col] = c10[i] * s1;
+            Y[(size_t) (row + 16) * ldy + col + 16] = c11[i] * s1;
+        }
+        return;
+    }
     for (int i = 0; i < 8; ++i) {
         const int row = m0 + 8 * (lane >> 4) + i;
         if (row >= T) break;
@@ -298,6 +310,9 @@ __global__ void fp8_gemm_kernel_lds128(const uint8_t* __restrict__ X, const uint
         const v2i bv = (gc < N) ? ld8(W + (size_t) gc * K + k0 + lk) : z2;
         *reinterpret_cast<v2i*>(Bs + (lr & 63) * 16 + lk) = bv;
         __syncthreads();
+        // keep one k-step's fragments live, not four: without this the compiler hoists every
+        // step's LDS fragment loads above the first WMMA (hundreds of moves stalled up front).
+        __builtin_amdgcn_sched_barrier(0);
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const v2i a = *reinterpret_cast<const v2i*>(As + (arow + 16 * i) * 16 + k8);
