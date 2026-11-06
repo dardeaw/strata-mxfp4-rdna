@@ -542,6 +542,9 @@ static float grouped_event_ms(hipEvent_t a, hipEvent_t b) {
 
 void bench_mxfp4_grouped(int T, int E) {
     GroupedBatch b = grouped_make(T, E);
+    uint8_t* gtrash = nullptr;
+    const bool gcold = std::getenv("STRATA_BENCH_COLD") != nullptr;
+    if (gcold) CHECK(hipMalloc((void**) &gtrash, 96ull << 20) == hipSuccess, "gb trash alloc");
     grouped_run_pre(b);
     grouped_run_ink(b);
     CHECK(hipDeviceSynchronize() == hipSuccess, "gb warmup sync");
@@ -552,31 +555,37 @@ void bench_mxfp4_grouped(int T, int E) {
     const double flops_d = (double) E * 2.0 * T * 2560.0 * 640.0;
     float pre[3], ink[3], preg[3], inkg[3], pred[3], inkd[3];
     for (int i = 0; i < 3; ++i) {
+        if (gtrash) CHECK(hipMemset(gtrash, (unsigned) i, 96ull << 20) == hipSuccess, "gb evict");
         hipEventRecord(a);
         grouped_run_pre(b);
         hipEventRecord(ev);
         CHECK(hipEventSynchronize(ev) == hipSuccess, "gb pre sync");
         pre[i] = grouped_event_ms(a, ev);
+        if (gtrash) CHECK(hipMemset(gtrash, (unsigned) i, 96ull << 20) == hipSuccess, "gb evict");
         hipEventRecord(a);
         grouped_run_ink(b);
         hipEventRecord(ev);
         CHECK(hipEventSynchronize(ev) == hipSuccess, "gb ink sync");
         ink[i] = grouped_event_ms(a, ev);
+        if (gtrash) CHECK(hipMemset(gtrash, (unsigned) i, 96ull << 20) == hipSuccess, "gb evict");
         hipEventRecord(a);
         CHECK(strata::prefill::fp8_grouped_gemm(b.dX, b.dXs, b.tFgu, (int) b.fgu.size(), nullptr), "gb t preg");
         hipEventRecord(ev);
         CHECK(hipEventSynchronize(ev) == hipSuccess, "gb preg sync");
         preg[i] = grouped_event_ms(a, ev);
+        if (gtrash) CHECK(hipMemset(gtrash, (unsigned) i, 96ull << 20) == hipSuccess, "gb evict");
         hipEventRecord(a);
         CHECK(strata::prefill::mxfp4_grouped_gemm_gu(b.dX, b.dXs, b.tMgu, (int) b.mgu.size(), nullptr), "gb t inkg");
         hipEventRecord(ev);
         CHECK(hipEventSynchronize(ev) == hipSuccess, "gb inkg sync");
         inkg[i] = grouped_event_ms(a, ev);
+        if (gtrash) CHECK(hipMemset(gtrash, (unsigned) i, 96ull << 20) == hipSuccess, "gb evict");
         hipEventRecord(a);
         CHECK(strata::prefill::fp8_grouped_gemm(b.dH, b.dHs, b.tFd, (int) b.fd.size(), nullptr), "gb t pred");
         hipEventRecord(ev);
         CHECK(hipEventSynchronize(ev) == hipSuccess, "gb pred sync");
         pred[i] = grouped_event_ms(a, ev);
+        if (gtrash) CHECK(hipMemset(gtrash, (unsigned) i, 96ull << 20) == hipSuccess, "gb evict");
         hipEventRecord(a);
         CHECK(strata::prefill::mxfp4_grouped_gemm_d(b.dH, b.dHs, b.tMd, (int) b.md.size(), nullptr), "gb t inkd");
         hipEventRecord(ev);
@@ -593,11 +602,58 @@ void bench_mxfp4_grouped(int T, int E) {
         med(preg), med(inkg), med(pred), med(inkd));
     (void) flops_gu; (void) flops_d;
     hipEventDestroy(a); hipEventDestroy(ev);
+    if (gtrash) CHECK(hipFree(gtrash) == hipSuccess, "gb trash free");
     grouped_free(b);
 }
 
 }  // namespace
 
+void bench_dequant_gu(int reps) {
+    const int64_t n_ff = 640, n_embd = 2560;
+    const int rb = (int) (n_embd / 32) * 17;
+    std::vector<uint8_t> gate((size_t) n_ff * rb, 0x38), up((size_t) n_ff * rb, 0x38);
+    const size_t outb = (size_t) 2 * n_ff * n_embd;
+    uint8_t* dG = (uint8_t*) dev_alloc(gate.size(), "bdq G");
+    uint8_t* dU = (uint8_t*) dev_alloc(gate.size(), "bdq U");
+    uint8_t* dF = (uint8_t*) dev_alloc(outb, "bdq F");
+    CHECK(hipMemcpy(dG, gate.data(), gate.size(), hipMemcpyHostToDevice) == hipSuccess, "bdq up");
+    CHECK(hipMemcpy(dU, up.data(), up.size(), hipMemcpyHostToDevice) == hipSuccess, "bdq up2");
+    for (int i = 0; i < 3; ++i) strata::kernels::iq_dequant_gu_mxfp4_fp8(39, dG, dU, n_ff, n_embd, dF, nullptr);
+    CHECK(hipDeviceSynchronize() == hipSuccess, "bdq warmup");
+    hipEvent_t a, b;
+    hipEventCreate(&a); hipEventCreate(&b);
+    hipEventRecord(a);
+    for (int i = 0; i < reps; ++i) strata::kernels::iq_dequant_gu_mxfp4_fp8(39, dG, dU, n_ff, n_embd, dF, nullptr);
+    hipEventRecord(b);
+    CHECK(hipEventSynchronize(b) == hipSuccess, "bdq sync");
+    float ms = 0;
+    hipEventElapsedTime(&ms, a, b);
+    double gbps = (gate.size() * 2 + outb) * reps / (ms * 1e-3) / 1e9;
+    std::printf("bench dequant_gu: %.3f ms/call, %.0f GB/s\n", ms / reps, gbps);
+    hipEventDestroy(a); hipEventDestroy(b);
+    hipFree(dG); hipFree(dU); hipFree(dF);
+}
+void bench_dequant_d(int reps) {
+    const int64_t n = (int64_t) 2560 * 640;
+    std::vector<uint8_t> dn((size_t) (n / 32) * 17, 0x38);
+    uint8_t* dD = (uint8_t*) dev_alloc(dn.size(), "bdd D");
+    uint8_t* dF = (uint8_t*) dev_alloc((size_t) n, "bdd F");
+    CHECK(hipMemcpy(dD, dn.data(), dn.size(), hipMemcpyHostToDevice) == hipSuccess, "bdd up");
+    for (int i = 0; i < 3; ++i) strata::kernels::iq_dequant_mxfp4_fp8(39, dD, n, dF, nullptr);
+    CHECK(hipDeviceSynchronize() == hipSuccess, "bdd warmup");
+    hipEvent_t a, b;
+    hipEventCreate(&a); hipEventCreate(&b);
+    hipEventRecord(a);
+    for (int i = 0; i < reps; ++i) strata::kernels::iq_dequant_mxfp4_fp8(39, dD, n, dF, nullptr);
+    hipEventRecord(b);
+    CHECK(hipEventSynchronize(b) == hipSuccess, "bdd sync");
+    float ms = 0;
+    hipEventElapsedTime(&ms, a, b);
+    double gbps = (dn.size() + (size_t) n) * reps / (ms * 1e-3) / 1e9;
+    std::printf("bench dequant_d: %.3f ms/call, %.0f GB/s\n", ms / reps, gbps);
+    hipEventDestroy(a); hipEventDestroy(b);
+    hipFree(dD); hipFree(dF);
+}
 int main() {
     test_dequant();
     test_quant();
@@ -628,6 +684,8 @@ int main() {
     bench_gemm(1024, 2560, 640, 10);
     bench_gemm(2048, 2560, 640, 10);
     bench_gemm(4096, 2560, 640, 5);
+    bench_dequant_gu(20);
+    bench_dequant_d(20);
     if (failures != 0) {
         std::printf("FAILED: %d checks\n", failures);
         return 1;
