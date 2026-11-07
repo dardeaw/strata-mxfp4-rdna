@@ -1,13 +1,15 @@
 # MXFP4 for RDNA4 (gfx12) — Strata fork
 
 This is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata) that runs
-**MXFP4 experts** (E2M1 weights with E8M0 scales, 32-value blocks) on AMD
-**RDNA4 / gfx12** with **FP8 (E4M3) compute**, following vLLM's Quark W4A8 model.
-It also ships a `--kv-grow` configuration that keeps the dense weights on the GPU
-and gives the rest of the VRAM to the expert cache.
+**MXFP4 experts** (E2M1 weights with E8M0 scales, 32-value blocks) on AMD GPUs.
+On **RDNA4 / gfx12** it uses **FP8 (E4M3) compute** (vLLM's Quark W4A8 model);
+on **RDNA3 / gfx11xx** — and any card without FP8 WMMA — it automatically falls
+back to **FP16 compute**. It also ships a `--kv-grow` configuration that keeps
+the dense weights on the GPU and gives the rest of the VRAM to the expert cache.
 
-> This fork is about **Strata and RDNA4 only**. It is not related to gufo, MBufo,
-> or halogen, and nothing here is pushed to those repositories.
+> This fork is about **Strata on RDNA4 (and on RDNA3 through the FP16 path)**.
+> It is not related to gufo, MBufo, or halogen, and nothing here is pushed to
+> those repositories.
 
 ## Status
 
@@ -20,6 +22,44 @@ and gives the rest of the VRAM to the expert cache.
   in (exact: a power of two times at most four significant bits), the
   activations are quantized per row to E4M3, and the products run on gfx12 FP8
   WMMA.
+
+## GPU support: RDNA4 vs RDNA3
+
+The MXFP4 route is the same on both families (E2M1 weights + E8M0 scales); only
+the compute precision differs. The choice is made at startup from the card's
+`gcnArchName`, never from the env var alone, so a wrong `STRATA_MXFP4_FP8` can
+never select a kernel the GPU cannot run.
+
+| | RDNA4 (gfx12: RX 9070 / 9070 XT, gfx1200/1201/1250) | RDNA3 (gfx11xx: RX 7900 XTX, 7800, 7700, ...) |
+|---|---|---|
+| Weights | MXFP4 -> E4M3 inside the GEMM (folded kernel: reads the 17-byte blocks straight, no dequant pass) | MXFP4 -> **FP16** (`iq_dequant_*_f16`, llama.cpp formulas) |
+| Compute | **FP8 E4M3 WMMA** (`wmma_f32_16x16x16_fp8_fp8_w32_gfx12`), FP32 accumulate | **FP16 matrix cores**, FP32 accumulate |
+| Activations | dynamic per-row E4M3 quantize | FP16 (no quantize) |
+| Selected by | `mx_fp8_on()` == gfx12 and `STRATA_MXFP4_FP8=1` | anything else, or `STRATA_MXFP4_FP8` unset / `0` |
+| Speed | the reference setting; prefill ~1.9-2.1K tok/s at 32K-250K on the RX 9070 | slower per token (FP16 weights are 2x the bytes of E4M3); not benchmarked on RDNA3 hardware here |
+
+**Why RDNA3 has no FP8 path:** `gfx11xx` has no FP8 (E4M3/E5M2) matrix-core
+instructions. The kernels build `__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12`
+for `gfx1201`; on an RDNA3 card they cannot launch. Instead of failing, the
+engine reads `gcnArchName`, and if it is not `gfx12*` it prints one warning and
+runs the FP16 expert GEMMs it has always had:
+
+```
+prefill: STRATA_MXFP4_FP8 is set but this GPU has no FP8 WMMA
+(gfx12/RDNA4 required, got gfx1100) -- falling back to the FP16 expert path
+```
+
+Overrides:
+
+- `STRATA_MXFP4_FP8=0` (or unset): use the FP16 path everywhere.
+- `STRATA_FP8_WMMA=0`: force the FP16 path even on a gfx12 card (A/B testing, or
+  a driver problem with the FP8 kernels).
+- On RDNA4 the FP8/folded fast path is the default; nothing needs setting.
+
+Validation: no RDNA3 GPU was on hand to measure, so the FP16 fallback was
+exercised on a gfx1201 card by forcing `STRATA_FP8_WMMA=0` — an 8K prompt
+prefills at ~1.44K tok/s and generates cleanly, the same code path the automatic
+gate selects on RDNA3.
 
 ## Results
 
@@ -86,7 +126,12 @@ running. The launcher sets `STRATA_MXFP4_FP8=1` and the config uses
 - **Weights**: MXFP4 (E2M1 + one E8M0 scale per 32 values) -> E4M3 with the
   scale folded in. The value is a power of two times a 4-bit significand, so
   the E4M3 encoding is exact in the normal range; it is saturated only at the
-  E4M3 limits.
+  E4M3 limits. On RDNA4 the default (`STRATA_MXFP4_FOLDED=1`) converts the
+  nibbles to E4M3 in the GEMM's W staging with a `v_perm` LUT and applies the
+  per-row max exponent (`Wref`) once in the epilogue, so there is no separate
+  dequant pass and no FP8 weight copy; because E8M0 scales are powers of two
+  the result is bit-identical to the pre-dequant path. RDNA3 uses the FP16
+  dequant instead (see GPU support).
 - **Activations**: dynamic per-row E4M3 quantization (`max_abs / 448`), with the
   scale applied back in the GEMM epilogue.
 - **GEMM**: gfx12 `__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12`,
