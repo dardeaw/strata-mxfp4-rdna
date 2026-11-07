@@ -48,4 +48,16 @@ bool mxfp4_grouped_tiled_gu(const uint8_t* X, const float* row_scale, const Mxfp
 bool mxfp4_grouped_tiled_d(const uint8_t* X, const float* row_scale, const Mxfp4ExpertTile* tiles, int num_tiles,
                            void* stream);
 
+/// Folded MXFP4 expert GEMM (radiance layout): row-major E4M3 activations, weights read straight
+/// from the 17-byte GGUF blocks and converted to E4M3 in the W staging with a v_perm LUT, so no
+/// FP8 weight copy and no separate dequant pass.  wref is the per-row max block exponent (N bytes,
+/// see mxfp4_folded_wref), applied once in the epilogue as 2^(ref-127); nothing underflows because
+/// ref is the row max.  Numerics differ from the pre-dequant FP8 path by a sub-percent re-quantization
+/// of the weight magnitude, so this stays behind STRATA_MXFP4_FOLDED and is A/B'd, never a silent swap.
+bool mxfp4_folded_wref(const uint8_t* gate, const uint8_t* up, const uint8_t* down, uint8_t* wref,
+                       int64_t N, int64_t K, bool gu, void* stream);
+bool mxfp4_folded_gu(const uint8_t* X, const uint8_t* gate, const uint8_t* up, const uint8_t* wref, float* Y,
+                     int64_t T, int64_t N, int64_t K, int64_t ldy, const float* row_scale, void* stream);
+bool mxfp4_folded_d(const uint8_t* X, const uint8_t* down, const uint8_t* wref, float* Y, int64_t T, int64_t N,
+                    int64_t K, int64_t ldy, const float* row_scale, void* stream);
 }  // namespace strata::prefill

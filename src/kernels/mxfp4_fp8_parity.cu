@@ -223,7 +223,7 @@ void test_mxfp4_gemm() {
         for (int r = 0; r < rows; ++r)
             for (int b = 0; b < rb / 17; ++b) {
                 uint8_t* blk = w.data() + (size_t) r * rb + (size_t) b * 17;
-                blk[0] = (uint8_t) (100 + (rng() % 40));
+                blk[0] = (uint8_t) (126 + (rng() % 3));   // realistic: the row exponents cluster
                 for (int j = 0; j < 16; ++j) blk[1 + j] = (uint8_t) (rng() & 0xFF);
             }
     };
@@ -349,6 +349,44 @@ void test_mxfp4_gemm() {
             std::printf("mx in-kernel vs pre-dequant ref T=%d: max abs diff %.3g\n", T, md);
         }
 
+        // Folded kernel (radiance layout): blob read directly, v_perm LUT, common-exponent epilogue.
+        // Numeric delta vs the pre-dequant fp8_gemm reference, and the time both paths take.
+        {
+            uint8_t* dWr = (uint8_t*) dev_alloc((size_t) Ngu, "mx wref gu");
+            CHECK(strata::prefill::mxfp4_folded_wref(dG, dU, nullptr, dWr, Ngu, Kgu, true, nullptr), "folded wref gu");
+            CHECK(strata::prefill::mxfp4_folded_gu(dX, dG, dU, dWr, dY, T, Ngu, Kgu, Ngu, dR, nullptr), "folded gu T=%d", T);
+            CHECK(hipDeviceSynchronize() == hipSuccess, "folded gu sync");
+            std::vector<float> Yf((size_t) T * Ngu);
+            CHECK(hipMemcpy(Yf.data(), dY, Yf.size() * 4, hipMemcpyDeviceToHost) == hipSuccess, "folded gu down");
+            double md = 0, l2 = 0, rl2 = 0;
+            for (size_t i = 0; i < Yf.size(); ++i) {
+                const double d = (double) Yf[i] - (double) Yref[i];
+                md = std::fmax(md, std::fabs(d)); l2 += d * d; rl2 += (double) Yref[i] * (double) Yref[i];
+            }
+            std::printf("folded gu T=%d vs pre-dequant: max abs %.3g, rel_l2 %.3g\n", T, md, std::sqrt(l2 / rl2));
+            const int reps = 20;
+            hipEvent_t e0, e1; hipEventCreate(&e0); hipEventCreate(&e1);
+            for (int i = 0; i < 3; ++i) strata::prefill::mxfp4_folded_gu(dX, dG, dU, dWr, dY, T, Ngu, Kgu, Ngu, dR, nullptr);
+            CHECK(hipEventSynchronize(e1) == hipSuccess, "folded warm sync");
+            hipEventRecord(e0);
+            for (int i = 0; i < reps; ++i) strata::prefill::mxfp4_folded_gu(dX, dG, dU, dWr, dY, T, Ngu, Kgu, Ngu, dR, nullptr);
+            hipEventRecord(e1); CHECK(hipEventSynchronize(e1) == hipSuccess, "folded gu sync2");
+            float msf = 0; hipEventElapsedTime(&msf, e0, e1);
+            uint8_t* dF3 = (uint8_t*) dev_alloc((size_t) Ngu * Kgu, "mx F3");
+            strata::kernels::iq_dequant_gu_mxfp4_fp8(39, dG, dU, n_ff, n_embd, dF3, nullptr);
+            hipEventRecord(e0);
+            for (int i = 0; i < reps; ++i) {
+                strata::kernels::iq_dequant_gu_mxfp4_fp8(39, dG, dU, n_ff, n_embd, dF3, nullptr);
+                strata::prefill::fp8_gemm(dX, dF3, dY, T, Ngu, Kgu, Ngu, dR, nullptr);
+            }
+            hipEventRecord(e1); CHECK(hipEventSynchronize(e1) == hipSuccess, "predeq sync");
+            float msp = 0; hipEventElapsedTime(&msp, e0, e1);
+            const double fl = 2.0 * T * (double) Ngu * Kgu;
+            std::printf("mx gu T=%d: folded %.3f ms (%.0f TF) | dequant+fp8 %.3f ms (%.0f TF) | %.2fx\n",
+                        T, msf / reps, fl / (msf / reps) * 1e-9, msp / reps, fl / (msp / reps) * 1e-9, msp / msf);
+            hipEventDestroy(e0); hipEventDestroy(e1); hipFree(dF3); hipFree(dWr);
+        }
+
         CHECK(strata::prefill::mxfp4_gemm_d(dXd, dD, dY, T, Nd, Kd, Nd, dR, nullptr), "mxfp4 d T=%d", T);
         CHECK(hipDeviceSynchronize() == hipSuccess, "mx d sync");
         std::vector<float> Yd((size_t) T * Nd);
@@ -376,6 +414,46 @@ void test_mxfp4_gemm() {
         }
         CHECK(bad == 0, "mx d T=%d: %d bad (worst %.2g)", T, bad, worst);
         std::printf("mx d T=%d: worst rel %.2g, bad %d\n", T, worst, bad);
+
+        {
+            uint8_t* dWr = (uint8_t*) dev_alloc((size_t) Nd, "mx wref d");
+            CHECK(strata::prefill::mxfp4_folded_wref(nullptr, nullptr, dD, dWr, Nd, Kd, false, nullptr), "folded wref d");
+            std::vector<float> YrefD((size_t) T * Nd);
+            uint8_t* dF4 = (uint8_t*) dev_alloc((size_t) Nd * Kd, "mx F4");
+            strata::kernels::iq_dequant_mxfp4_fp8(39, dD, Nd * Kd, dF4, nullptr);
+            CHECK(strata::prefill::fp8_gemm(dXd, dF4, dY, T, Nd, Kd, Nd, dR, nullptr), "ref d gemm");
+            CHECK(hipDeviceSynchronize() == hipSuccess, "ref d sync");
+            CHECK(hipMemcpy(YrefD.data(), dY, YrefD.size() * 4, hipMemcpyDeviceToHost) == hipSuccess, "ref d down");
+            CHECK(strata::prefill::mxfp4_folded_d(dXd, dD, dWr, dY, T, Nd, Kd, Nd, dR, nullptr), "folded d T=%d", T);
+            CHECK(hipDeviceSynchronize() == hipSuccess, "folded d sync");
+            std::vector<float> Yf((size_t) T * Nd);
+            CHECK(hipMemcpy(Yf.data(), dY, Yf.size() * 4, hipMemcpyDeviceToHost) == hipSuccess, "folded d down");
+            double md = 0, l2 = 0, rl2 = 0;
+            for (size_t i = 0; i < Yf.size(); ++i) {
+                const double d = (double) Yf[i] - (double) YrefD[i];
+                md = std::fmax(md, std::fabs(d)); l2 += d * d; rl2 += (double) YrefD[i] * (double) YrefD[i];
+            }
+            std::printf("folded d  T=%d vs pre-dequant: max abs %.3g, rel_l2 %.3g\n", T, md, std::sqrt(l2 / rl2));
+            const int reps = 20;
+            hipEvent_t e0, e1; hipEventCreate(&e0); hipEventCreate(&e1);
+            for (int i = 0; i < 3; ++i) strata::prefill::mxfp4_folded_d(dXd, dD, dWr, dY, T, Nd, Kd, Nd, dR, nullptr);
+            CHECK(hipEventSynchronize(e1) == hipSuccess, "folded d warm sync");
+            hipEventRecord(e0);
+            for (int i = 0; i < reps; ++i) strata::prefill::mxfp4_folded_d(dXd, dD, dWr, dY, T, Nd, Kd, Nd, dR, nullptr);
+            hipEventRecord(e1); CHECK(hipEventSynchronize(e1) == hipSuccess, "folded d sync2");
+            float msf = 0; hipEventElapsedTime(&msf, e0, e1);
+            hipEventRecord(e0);
+            for (int i = 0; i < reps; ++i) {
+                strata::kernels::iq_dequant_mxfp4_fp8(39, dD, Nd * Kd, dF4, nullptr);
+                strata::prefill::fp8_gemm(dXd, dF4, dY, T, Nd, Kd, Nd, dR, nullptr);
+            }
+            hipEventRecord(e1); CHECK(hipEventSynchronize(e1) == hipSuccess, "predeq d sync");
+            float msp = 0; hipEventElapsedTime(&msp, e0, e1);
+            const double fl = 2.0 * T * (double) Nd * Kd;
+            std::printf("mx d  T=%d: folded %.3f ms (%.0f TF) | dequant+fp8 %.3f ms (%.0f TF) | %.2fx\n",
+                        T, msf / reps, fl / (msf / reps) * 1e-9, msp / reps, fl / (msp / reps) * 1e-9, msp / msf);
+            hipEventDestroy(e0); hipEventDestroy(e1); hipFree(dF4); hipFree(dWr);
+        }
         hipFree(dX); hipFree(dXd); hipFree(dG); hipFree(dU); hipFree(dD); hipFree(dR); hipFree(dY);
     }
 }
@@ -410,7 +488,7 @@ GroupedBatch grouped_make(int T, int E) {
         for (int r = 0; r < rows; ++r)
             for (int bb = 0; bb < rb / 17; ++bb) {
                 uint8_t* blk = w.data() + (size_t) r * rb + (size_t) bb * 17;
-                blk[0] = (uint8_t) (100 + (rng() % 40));
+                blk[0] = (uint8_t) (126 + (rng() % 3));   // realistic: the row exponents cluster
                 for (int j = 0; j < 16; ++j) blk[1 + j] = (uint8_t) (rng() & 0xFF);
             }
     };
@@ -654,6 +732,122 @@ void bench_dequant_d(int reps) {
     hipEventDestroy(a); hipEventDestroy(b);
     hipFree(dD); hipFree(dF);
 }
+
+// Slice-2 scouting: per-expert in-kernel MXFP4 (no pre-dequant) at production shapes.
+void bench_mxfp4_perexpert(int T, int N, int K, bool is_gu) {
+    const int rows = is_gu ? N / 2 : N;
+    const int rb = (K / 32) * 17;
+    std::mt19937 rng(777);
+    std::vector<uint8_t> gate((size_t)rows * rb), up;
+    if (is_gu) up.assign((size_t)rows * rb, 0);
+    std::vector<uint8_t> X((size_t)T * K);
+    std::vector<float> rs(T, 1.f);
+    auto fill = [&](std::vector<uint8_t>& w) {
+        for (size_t i = 0; i < w.size(); i += 17) {
+            w[i] = (uint8_t)(110 + (rng() % 20));
+            for (int j = 1; j < 17; ++j) w[i + j] = (uint8_t)(rng() & 0xFF);
+        }
+    };
+    fill(gate); if (is_gu) fill(up);
+    for (auto& v : X) v = (unsigned char)(rng() % 120);
+    uint8_t* dX = (uint8_t*)dev_alloc(X.size(), "mpe X");
+    uint8_t* dG = (uint8_t*)dev_alloc(gate.size(), "mpe gate");
+    uint8_t* dU = is_gu ? (uint8_t*)dev_alloc(up.size(), "mpe up") : nullptr;
+    float* dR = (float*)dev_alloc(T * sizeof(float), "mpe rs");
+    float* dY = (float*)dev_alloc((size_t)T * N * 4, "mpe Y");
+    CHECK(hipMemcpy(dX, X.data(), X.size(), hipMemcpyHostToDevice) == hipSuccess, "mpe up");
+    CHECK(hipMemcpy(dG, gate.data(), gate.size(), hipMemcpyHostToDevice) == hipSuccess, "mpe up2");
+    if (is_gu) CHECK(hipMemcpy(dU, up.data(), up.size(), hipMemcpyHostToDevice) == hipSuccess, "mpe up3");
+    CHECK(hipMemcpy(dR, rs.data(), T * sizeof(float), hipMemcpyHostToDevice) == hipSuccess, "mpe up4");
+    for (int i = 0; i < 3; ++i) {
+        if (is_gu) strata::prefill::mxfp4_gemm_gu(dX, dG, dU, dY, T, N, K, N, dR, nullptr);
+        else strata::prefill::mxfp4_gemm_d(dX, dG, dY, T, N, K, N, dR, nullptr);
+    }
+    CHECK(hipDeviceSynchronize() == hipSuccess, "mpe warmup");
+    hipEvent_t a, b; hipEventCreate(&a); hipEventCreate(&b);
+    const int reps = 10;
+    hipEventRecord(a);
+    for (int i = 0; i < reps; ++i) {
+        if (is_gu) strata::prefill::mxfp4_gemm_gu(dX, dG, dU, dY, T, N, K, N, dR, nullptr);
+        else strata::prefill::mxfp4_gemm_d(dX, dG, dY, T, N, K, N, dR, nullptr);
+    }
+    hipEventRecord(b); CHECK(hipEventSynchronize(b) == hipSuccess, "mpe sync");
+    float ms = 0; hipEventElapsedTime(&ms, a, b);
+    double gflop = 2.0 * T * (double)N * K * reps / 1e9;
+    std::printf("bench mxfp4-perexpert T=%d N=%d K=%d %s: %.3f ms/call, %.1f TFLOPS\n",
+        T, N, K, is_gu ? "gu" : "dn", ms / reps, gflop / (ms / 1e3) / 1e12);
+    hipEventDestroy(a); hipEventDestroy(b);
+    hipFree(dX); hipFree(dG); if (dU) hipFree(dU); hipFree(dR); hipFree(dY);
+}
+
+// Production-shape head-to-head: folded (4-bit read straight in the GEMM) vs the current
+// dequant-to-FP8 + fp8_gemm pair.  Both run on the identical blob/X/rs, so the ratio is the
+// end-to-end per-expert kernel cost the prefill flush actually pays.
+void bench_folded_prod(int T, int N, int K, bool gu, int reps) {
+    const int wr = gu ? N / 2 : N;          // weight rows per matrix (gu: gate and up, each N/2)
+    const int rb = (K / 32) * 17;
+    std::mt19937 rng(0xabcd + T * 7 + (size_t) N + K);
+    std::vector<uint8_t> g((size_t) wr * rb), u;
+    if (gu) u.assign((size_t) wr * rb, 0);
+    auto fill = [&](std::vector<uint8_t>& w) {
+        for (size_t i = 0; i < w.size(); i += 17) {
+            w[i] = (uint8_t)(124 + (rng() % 6));   // varied row exponents, incl. 2^(ref-scale) clamps
+            for (int j = 1; j < 17; ++j) w[i + j] = (uint8_t)(rng() & 0xFF);
+        }
+    };
+    fill(g); if (gu) fill(u);
+    std::vector<uint8_t> X((size_t) T * K);
+    for (auto& v : X) v = (unsigned char)(0x30 + (rng() % 0x30));
+    std::vector<float> rs(T, 1.f);
+
+    uint8_t* dX = (uint8_t*) dev_alloc(X.size(), "fp X");
+    uint8_t* dG = (uint8_t*) dev_alloc(g.size(), "fp G");
+    uint8_t* dU = gu ? (uint8_t*) dev_alloc(u.size(), "fp U") : nullptr;
+    uint8_t* dWr = (uint8_t*) dev_alloc((size_t) N, "fp wref");
+    uint8_t* dF = (uint8_t*) dev_alloc((size_t) N * K, "fp F");
+    float* dR = (float*) dev_alloc(T * sizeof(float), "fp rs");
+    float* dY = (float*) dev_alloc((size_t) T * N * 4, "fp Y");
+    CHECK(hipMemcpy(dX, X.data(), X.size(), hipMemcpyHostToDevice) == hipSuccess, "fp X up");
+    CHECK(hipMemcpy(dG, g.data(), g.size(), hipMemcpyHostToDevice) == hipSuccess, "fp G up");
+    if (gu) CHECK(hipMemcpy(dU, u.data(), u.size(), hipMemcpyHostToDevice) == hipSuccess, "fp U up");
+    CHECK(hipMemcpy(dR, rs.data(), T * sizeof(float), hipMemcpyHostToDevice) == hipSuccess, "fp rs up");
+
+    if (gu) CHECK(strata::prefill::mxfp4_folded_wref(dG, dU, nullptr, dWr, N, K, true, nullptr), "fp wref gu");
+    else    CHECK(strata::prefill::mxfp4_folded_wref(nullptr, nullptr, dG, dWr, N, K, false, nullptr), "fp wref d");
+
+    auto run_folded = [&]() -> bool {
+        if (gu) return strata::prefill::mxfp4_folded_gu(dX, dG, dU, dWr, dY, T, N, K, N, dR, nullptr);
+        return strata::prefill::mxfp4_folded_d(dX, dG, dWr, dY, T, N, K, N, dR, nullptr);
+    };
+    auto run_deq = [&]() -> bool {
+        if (gu) strata::kernels::iq_dequant_gu_mxfp4_fp8(39, dG, dU, wr, K, dF, nullptr);
+        else    strata::kernels::iq_dequant_mxfp4_fp8(39, dG, (int64_t) N * K, dF, nullptr);
+        return strata::prefill::fp8_gemm(dX, dF, dY, T, N, K, N, dR, nullptr);
+    };
+    for (int i = 0; i < 3; ++i) { CHECK(run_folded(), "fp folded warm"); CHECK(run_deq(), "fp deq warm"); }
+    CHECK(hipDeviceSynchronize() == hipSuccess, "fp warm sync");
+
+    const bool cold = std::getenv("STRATA_BENCH_COLD") != nullptr;
+    uint8_t* trash = nullptr;
+    if (cold) CHECK(hipMalloc((void**) &trash, 96ull << 20) == hipSuccess, "fp trash alloc");
+    hipEvent_t a, b; hipEventCreate(&a); hipEventCreate(&b);
+    hipEventRecord(a);
+    for (int i = 0; i < reps; ++i) { if (cold) hipMemset(trash, i & 0xff, 96ull << 20); run_folded(); }
+    hipEventRecord(b); CHECK(hipEventSynchronize(b) == hipSuccess, "fp folded sync");
+    float msf = 0; hipEventElapsedTime(&msf, a, b);
+    hipEventRecord(a);
+    for (int i = 0; i < reps; ++i) { if (cold) hipMemset(trash, i & 0xff, 96ull << 20); run_deq(); }
+    hipEventRecord(b); CHECK(hipEventSynchronize(b) == hipSuccess, "fp deq sync");
+    float msd = 0; hipEventElapsedTime(&msd, a, b);
+    if (trash) CHECK(hipFree(trash) == hipSuccess, "fp trash free");
+    const double fl = 2.0 * T * (double) N * K;
+    std::printf("folded-vs-deq T=%d N=%d K=%d %s: folded %.3f ms (%.1f TF) | deq+fp8 %.3f ms (%.1f TF) | %.2fx\n",
+                T, N, K, gu ? "gu" : "dn", msf / reps, fl / (msf / reps) * 1e-9,
+                msd / reps, fl / (msd / reps) * 1e-9, msd / msf);
+    hipEventDestroy(a); hipEventDestroy(b);
+    hipFree(dX); hipFree(dG); if (dU) hipFree(dU); hipFree(dWr); hipFree(dF); hipFree(dR); hipFree(dY);
+}
+
 int main() {
     test_dequant();
     test_quant();
@@ -684,8 +878,32 @@ int main() {
     bench_gemm(1024, 2560, 640, 10);
     bench_gemm(2048, 2560, 640, 10);
     bench_gemm(4096, 2560, 640, 5);
+    // head-to-head vs the folded kernel at production per-expert shapes
+    bench_gemm(250, 1280, 2560, 20);   // GU   (median expert)
+    bench_gemm(500, 1280, 2560, 20);
+    bench_gemm(1000, 1280, 2560, 20);
+    bench_gemm(2000, 1280, 2560, 10);
+    bench_gemm(250, 2560, 640, 20);    // DOWN
+    bench_gemm(500, 2560, 640, 20);
+    bench_gemm(1000, 2560, 640, 20);
+    bench_gemm(2000, 2560, 640, 10);
+    bench_mxfp4_perexpert(250, 1280, 2560, true);
+    bench_mxfp4_perexpert(1024, 1280, 2560, true);
+    bench_mxfp4_perexpert(2048, 1280, 2560, true);
+    bench_mxfp4_perexpert(250, 2560, 640, false);
+    bench_mxfp4_perexpert(1024, 2560, 640, false);
+    bench_mxfp4_perexpert(2048, 2560, 640, false);
     bench_dequant_gu(20);
     bench_dequant_d(20);
+    // production-shape folded vs dequant+fp8: GU (N=1280, K=2560), DOWN (N=2560, K=640)
+    bench_folded_prod(250, 1280, 2560, true, 20);
+    bench_folded_prod(500, 1280, 2560, true, 20);
+    bench_folded_prod(1000, 1280, 2560, true, 20);
+    bench_folded_prod(2000, 1280, 2560, true, 10);
+    bench_folded_prod(250, 2560, 640, false, 20);
+    bench_folded_prod(500, 2560, 640, false, 20);
+    bench_folded_prod(1000, 2560, 640, false, 20);
+    bench_folded_prod(2000, 2560, 640, false, 10);
     if (failures != 0) {
         std::printf("FAILED: %d checks\n", failures);
         return 1;
