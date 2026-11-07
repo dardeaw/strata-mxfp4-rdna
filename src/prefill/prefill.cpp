@@ -1641,12 +1641,46 @@ bool pf_wmma() {
 #endif
 }
 // STRATA_MXFP4_FP8=1: MXFP4 experts take the FP8 prompt path (vLLM's Quark W4A8 compute model).  The E2M1 weights
+// The MXFP4 W4A8 path needs FP8 (E4M3) WMMA, which exists only on RDNA4 / gfx12.  On RDNA3
+// (gfx110x) and every other family the FP8 GEMMs cannot launch, so the device capability has to
+// gate the opt-in: STRATA_MXFP4_FP8 alone must never select a kernel this GPU cannot run.
+const char* current_gcn_arch() {
+    static const std::string arch = [] {
+        int dev = 0;
+        cudaDeviceProp p{};
+        if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess)
+            return std::string(p.gcnArchName);
+        return std::string();
+    }();
+    return arch.c_str();
+}
+bool fp8_wmma_device() {
+    static const bool ok = [] {
+        const char* v = std::getenv("STRATA_FP8_WMMA");
+        if (v != nullptr && v[0] == '0') return false;   // operator override: force the FP16 expert path
+        return std::string(current_gcn_arch()).rfind("gfx12", 0) == 0;
+    }();
+    return ok;
+}
 // are dequantized to E4M3 with their per-32 E8M0 scale (exact: a power of two times <= 4 significant bits) and the
 // activations are quantized per row to E4M3, so the expert products run on gfx12's FP8 WMMA.
 bool mx_fp8_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_MXFP4_FP8");
-        return v != nullptr && v[0] == '1';
+        const bool want = v != nullptr && v[0] == '1';
+        if (!want) return false;
+        if (!fp8_wmma_device()) {
+            const char* ov = std::getenv("STRATA_FP8_WMMA");
+            if (ov != nullptr && ov[0] == '0')
+                std::fprintf(stderr, "prefill: STRATA_MXFP4_FP8 set but STRATA_FP8_WMMA=0 -- the FP16 expert path\n");
+            else
+                std::fprintf(stderr,
+                             "prefill: STRATA_MXFP4_FP8 is set but this GPU has no FP8 WMMA (gfx12/RDNA4 required, "
+                             "got %s) -- falling back to the FP16 expert path\n",
+                             current_gcn_arch());
+            return false;
+        }
+        return true;
     }();
     return on;
 }
@@ -5961,7 +5995,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                              f.n_embd, (uint8_t*) m.dq_gu[q], m.cs);
                                     strata::kernels::iq_dequant_mxfp4_fp8(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff,
                                                                           (uint8_t*) m.dq_d[q], m.cs);
-                                } else if (!fp8 && !mxfp4_folded_on()) {
+                                } else if (!fp8) {
                                     strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
                                                                        m.dq_gu[q], m.cs,
                                                                        f.tail_off ? (const float*) (blob_dev + f.tail_off) : nullptr);
@@ -7310,8 +7344,8 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                                                                      f.n_embd, (uint8_t*) m.dq_gu[dq], cs);
                             strata::kernels::iq_dequant_mxfp4_fp8(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff,
                                                                   (uint8_t*) m.dq_d[dq], cs);
-                        } else if (!fp8 && !mxfp4_folded_on()) {
-                            strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
+                            } else if (!fp8) {
+                                strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
                                                                m.dq_gu[dq], cs, nullptr);
                             strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[dq], cs,
                                                             nullptr);
