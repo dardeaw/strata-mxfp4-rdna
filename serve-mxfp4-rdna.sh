@@ -7,4 +7,4 @@ cd "$(dirname "$0")"
 export STRATA_MXFP4_FP8=1
 export STRATA_MXFP4_FOLDED=1
 exec .venv/bin/python -m serve.server --engine strata \
-  --config configs/mxfp4-rdna.json --port "${PORT:-8081}"
+  --config configs/mxfp4-rdna.json --port "${PORT:-8081}" --host "${HOST:-0.0.0.0}"
