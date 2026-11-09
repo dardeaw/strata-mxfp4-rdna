@@ -5886,15 +5886,137 @@ void iq_dequant_gu_mxfp4_fp8(int t, const void* gate, const void* up, int64_t n_
     check("iq_dequant_gu_mxfp4_fp8");
 }
 
+
+// ---- STRATA_FP8_STATS=1: real-activation crush census for the FP8 repair (hypothesis 1).
+// Env-gated; when off this is one getenv at first call and zero behavior change.
+// Tallies over every quantize_fp8_rows / fused_swiglu_quant_fp8 call: rows, elements,
+// E4M3-zero codes whose float input is nonzero (signal crushed to zero), saturated codes,
+// NaN codes, plus a log2 histogram of per-row amax (= scale*448, skipped for all-zero rows).
+// Dumped to stderr every 20000 calls and at process exit.
+namespace fp8stats {
+__device__ unsigned long long g_rows = 0;
+__device__ unsigned long long g_elems = 0;
+__device__ unsigned long long g_crushed = 0;
+__device__ unsigned long long g_sats = 0;
+__device__ unsigned long long g_nans = 0;
+__device__ unsigned long long g_amax_hist[32] = {};
+__global__ void census_kernel(const __half* __restrict__ x, const uint8_t* __restrict__ y,
+                              const float* __restrict__ scale, int64_t rows, int64_t cols) {
+    const int64_t r = blockIdx.x;
+    if (r >= rows) return;
+    __shared__ unsigned long long red[256];
+    __shared__ unsigned long long b_e, b_c, b_s, b_n;
+    unsigned long long c = 0, s = 0, n = 0, e = 0;
+    const uint8_t* yr = y + r * cols;
+    for (int64_t i = threadIdx.x; i < cols; i += blockDim.x) {
+        const uint8_t code = yr[i];
+        const uint8_t m = (uint8_t)(code & 0x7Fu);
+        ++e;
+        if (m == 0) {
+            if (x == nullptr || fabsf(__half2float(x[r * cols + i])) > 0.0f) ++c;
+        } else if (m == 0x7Eu) ++s;
+        else if (m == 0x7Fu) ++n;
+    }
+    red[threadIdx.x] = e; __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) b_e = red[0];
+    red[threadIdx.x] = c; __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) b_c = red[0];
+    red[threadIdx.x] = s; __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) b_s = red[0];
+    red[threadIdx.x] = n; __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x + st];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        b_n = red[0];
+        atomicAdd(&g_elems, b_e);
+        atomicAdd(&g_crushed, b_c);
+        atomicAdd(&g_sats, b_s);
+        atomicAdd(&g_nans, b_n);
+        atomicAdd(&g_rows, 1ULL);
+        if (b_e > b_c) {
+            const float amax = scale[r] * 448.0f;
+            int ee = 0;
+            frexpf(amax > 0.0f ? amax : 1.0f, &ee);
+            int bin = ee - 1 + 10;
+            if (bin < 0) bin = 0;
+            if (bin > 31) bin = 31;
+            atomicAdd(&g_amax_hist[bin], 1ULL);
+        }
+    }
+}
+inline bool enabled() {
+    static int on = -1;
+    if (on < 0) {
+        const char* v = std::getenv("STRATA_FP8_STATS");
+        on = (v != nullptr && v[0] == '1') ? 1 : 0;
+    }
+    return on == 1;
+}
+template <typename T>
+inline void symcpy(T* dst, const T& sym, bool& ok) {
+    void* addr = nullptr;
+    if (hipGetSymbolAddress(&addr, sym) != cudaSuccess) { ok = false; return; }
+    if (cudaMemcpy((void*)dst, addr, sizeof(T), cudaMemcpyDeviceToHost) != cudaSuccess) ok = false;
+}
+inline void dump() {
+    unsigned long long rows = 0, elems = 0, crushed = 0, sats = 0, nans = 0;
+    unsigned long long hist[32] = {};
+    bool ok = true;
+    symcpy(&rows, g_rows, ok);
+    symcpy(&elems, g_elems, ok);
+    symcpy(&crushed, g_crushed, ok);
+    symcpy(&sats, g_sats, ok);
+    symcpy(&nans, g_nans, ok);
+    {
+        void* addr = nullptr;
+        if (hipGetSymbolAddress(&addr, g_amax_hist) != cudaSuccess) ok = false;
+        else if (cudaMemcpy((void*)hist, addr, sizeof(hist), cudaMemcpyDeviceToHost) != cudaSuccess) ok = false;
+    }
+    if (!ok) { std::fprintf(stderr, "[fp8stats] dump memcpy FAILED\n"); return; }
+    std::fprintf(stderr, "[fp8stats] rows=%llu elems=%llu crushed=%llu (%.4f%%) sat=%llu nan=%llu\n",
+                 rows, elems, crushed, elems ? 100.0 * (double)crushed / (double)elems : 0.0, sats, nans);
+    std::fprintf(stderr, "[fp8stats] amax_hist(log2 bins -10..21):");
+    for (int i = 0; i < 32; ++i) std::fprintf(stderr, " %llu", hist[i]);
+    std::fprintf(stderr, "\n");
+}
+inline void maybe_census(const void* x, const uint8_t* y, const float* scale,
+                         int64_t rows, int64_t cols, void* stream) {
+    static int calls = 0;
+    static bool reg = false;
+    if (!enabled()) return;
+    if (!reg) { std::fprintf(stderr, "[fp8stats] armed\n"); std::atexit(dump); reg = true; }
+    census_kernel<<<(unsigned)rows, 256, 0, (cudaStream_t)stream>>>(
+        (const __half*)x, y, scale, rows, cols);
+    check("fp8_census");
+    if (++calls % 100 == 0) dump();
+}
+}  // namespace fp8stats
+
 void fused_swiglu_quant_fp8(const float* gu, int64_t n, uint8_t* y, float* scale, void* stream) {
     if (n <= 0) return;
     fused_swiglu_quant_fp8_kernel<<<(unsigned) n, 256, 0, (cudaStream_t) stream>>>(gu, n, y, scale);
     check("fused_swiglu_quant_fp8");
+    fp8stats::maybe_census(nullptr, y, scale, n, 640, stream);
 }
 void quantize_fp8_rows(const void* x, int64_t rows, int64_t cols, uint8_t* y, float* scale, void* stream) {
     if (rows <= 0 || cols <= 0) return;
     quantize_fp8_rows_kernel<<<(unsigned) rows, 256, 0, (cudaStream_t) stream>>>((const __half*) x, cols, y, scale);
     check("quantize_fp8_rows");
+    fp8stats::maybe_census(x, y, scale, rows, cols, stream);
 }
 
 // A bad block is a pack or caller error (expert_layout_load already refuses a block that does not divide the expert
