@@ -1664,6 +1664,15 @@ bool fp8_wmma_device() {
 }
 // are dequantized to E4M3 with their per-32 E8M0 scale (exact: a power of two times <= 4 significant bits) and the
 // activations are quantized per row to E4M3, so the expert products run on gfx12's FP8 WMMA.
+// STRATA_MXFP4_FP8_MIN_LAYER=n: layers below n stay on the FP16 expert path even when the FP8
+// path is on (drift-seed experiment: FP16 for the early layers, FP8 from layer n on).
+int64_t mx_fp8_min_layer() {
+    static const int64_t n = [] {
+        const char* v = std::getenv("STRATA_MXFP4_FP8_MIN_LAYER");
+        return (v != nullptr && *v != '\0') ? std::max<int64_t>(0, (int64_t) std::atoll(v)) : 0;
+    }();
+    return n;
+}
 bool mx_fp8_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_MXFP4_FP8");
@@ -5984,7 +5993,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int q = (int) (j % DQ);
                             const bool fp8 = lay.native && mx_fp8_on() && lay.fmt[(size_t) l].gu_type == 39 &&
                                              lay.fmt[(size_t) l].d_type == 39 && lay.fmt[(size_t) l].tail_off == 0 &&
-                                             m.x8 != nullptr && m.h8 != nullptr && m.x8s != nullptr && m.h8s != nullptr;
+                                             m.x8 != nullptr && m.h8 != nullptr && m.x8s != nullptr && m.h8s != nullptr && l >= mx_fp8_min_layer();
                             if (lay.native) {
                                 // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
                                 const auto& f = lay.fmt[(size_t) l];
@@ -7307,7 +7316,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
         // STRATA_MXFP4_FP8: the same FP16 path, with MXFP4 dequantized to E4M3 and the products on FP8 WMMA
         const bool fp8 = fp16_l && lay.native && lay.fmt[(size_t) l].gu_type == 39 &&
                          lay.fmt[(size_t) l].d_type == 39 && lay.fmt[(size_t) l].tail_off == 0 &&
-                         m.x8 != nullptr && m.h8 != nullptr && m.x8s != nullptr && m.h8s != nullptr;
+                         m.x8 != nullptr && m.h8 != nullptr && m.x8s != nullptr && m.h8s != nullptr && l >= mx_fp8_min_layer();
         const size_t mmq_gub = fp16_l ? 0 : mmq::matrix_bytes(mmq_gt, 1280, N), mmq_db = fp16_l ? 0 : mmq::matrix_bytes(mmq_dt, N, 640);
         size_t staged = 0, u = 0;
         const uint8_t* blob_dev = nullptr;
