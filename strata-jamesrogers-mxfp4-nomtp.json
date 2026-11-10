@@ -29,7 +29,7 @@
  ],
  "backend": "hip",
  "cwd": "/home/nobara-user/strata-0210",
- "exe": "/home/nobara-user/strata-0210/engine/strata",
+ "exe": "/home/nobara-user/strata-0210/build-hip/strata",
  "host": "0.0.0.0",
  "lib_dirs": [
   "/home/nobara-user/strata-0210/.venv/lib64/python3.14/site-packages/_rocm_sdk_devel/lib",
@@ -43,7 +43,6 @@
  "tokenizer": "/home/nobara-user/Strata-data/packs/jamesrogers-mxfp4/tokenizer",
  "env": {
   "STRATA_MXFP4_FP8": "0",
-  "STRATA_MXFP4_FOLDED": "0",
   "STRATA_FP8_GROUPED": "0",
   "STRATA_GFX12_DEFAULTS": "1",
   "STRATA_HIP_WMMA": "1",
@@ -53,6 +52,7 @@
   "STRATA_HC_UPMIX": "1",
   "STRATA_HC_Q8": "1",
   "STRATA_PREFILL_CPU_SHARE": "1",
-  "STRATA_ROUTE_TAIL_SKIP": "7"
+  "STRATA_ROUTE_TAIL_SKIP": "7",
+  "STRATA_PF_FUSED_MXFP4": "1"
  }
 }
