@@ -444,12 +444,18 @@ bool fp8_grouped_on() {
 // GEMMs per expert immediately (same stream order as today's giant-expert immediate path).
 // The MXFP4 blob (already staged) is read directly; no dq slots, no batch, no tiles.
 // STRATA_MXFP4_FOLDED=1: the radiance-layout GEMM -- weights read straight from the 17-byte blocks
-// and converted to E4M3 in the W staging (v_perm LUT), no dequant pass. Numerically identical to the
-// pre-dequant path on this model (row exponent spread <= 3, verified), but gated and A/B'd.
+// and converted to E4M3 in the W staging (v_perm LUT), no dequant pass. Bit-exact vs the
+// pre-dequant path on synthetic parity shapes only; DIVERGES on long-context real prompts
+// (measured 2026-11-09: sparse layer-6 blowup, attention cliff, 93% routing flips, 0/5 on the
+// 18.8k faithful prompt while FOLDED=0 is 5/5). Do not use for production inference; the
+// pre-dequant FP8 path (FOLDED=0) is the verified-correct FP8 path (same end-to-end speed).
 bool mxfp4_folded_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_MXFP4_FOLDED");
-        return v != nullptr && v[0] != 0 && std::atoi(v) != 0;
+        const bool e = v != nullptr && v[0] != 0 && std::atoi(v) != 0;
+        if (e) std::fprintf(stderr, "strata prefill: WARNING: STRATA_MXFP4_FOLDED=1: the folded MXFP4 "
+            "kernel is known-bad on long-context reasoning (0/5 measured); prefer FOLDED=0\n");
+        return e;
     }();
     return on;
 }
