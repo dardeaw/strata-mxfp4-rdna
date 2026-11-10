@@ -87,7 +87,13 @@ constexpr int T_IQ2_XXS = GGML_TYPE_IQ2_XXS, T_IQ2_XS = GGML_TYPE_IQ2_XS, T_IQ2_
               //   sum w x = d_x (d_w sum q a + m_w sum a):
               // the activation blocks carry sum a per 32 values in their eight spare bytes (quant_act_nat_kernel and
               // the H epilogue write it for every path; no other format reads it)
-              T_Q4_K = GGML_TYPE_Q4_K, T_Q5_K = GGML_TYPE_Q5_K, T_Q5_1 = GGML_TYPE_Q5_1, T_Q8_0 = GGML_TYPE_Q8_0;
+              T_Q4_K = GGML_TYPE_Q4_K, T_Q5_K = GGML_TYPE_Q5_K, T_Q5_1 = GGML_TYPE_Q5_1, T_Q8_0 = GGML_TYPE_Q8_0,
+              // gfx12 int8 fused experts for the jamesrogers MXFP4 pack (the folded FP8 path's exact-dot replacement):
+              // an MXFP4 block is 17 bytes (an E8M0 scale byte + 16 E2M1 code bytes) over 32 values, so it loads and
+              // stages exactly like IQ4_NL; the codes go through a 16-entry E2M1 table and the power-of-two scale is
+              // applied at the accumulator, so the products are exact integer dots (no E4M3 requantization).  This ggml
+              // has no GGML_TYPE_MXFP4 name; prefill.cpp's FP8 path uses the literal 39 for the same type.
+              T_MXFP4 = 39;
 static_assert(sizeof(block_iq2_xxs) == 66 && sizeof(block_iq2_xs) == 74 && sizeof(block_iq2_s) == 82 &&
               sizeof(block_iq3_xxs) == 98 && sizeof(block_iq3_s) == 110 && sizeof(block_iq4_xs) == 136 &&
               sizeof(block_iq4_nl) == 18 && sizeof(block_q2_0) == 18 && sizeof(block_q4_K) == 144 &&
@@ -97,7 +103,8 @@ static_assert(sizeof(block_iq2_xxs) == 66 && sizeof(block_iq2_xs) == 74 && sizeo
 // block bytes, scale per 16 values, codebook bytes in shared memory
 __host__ __device__ constexpr int block_bytes(int t) {
     return t == T_IQ2_XXS ? 66 : t == T_IQ2_XS ? 74 : t == T_IQ2_S ? 82 : t == T_IQ3_XXS ? 98 : t == T_IQ3_S ? 110
-         : t == T_IQ4_XS ? 136 : t == T_Q4_K ? 144 : t == T_Q5_K ? 176 : t == T_Q5_1 ? 24 : t == T_Q8_0 ? 34 : 18;
+         : t == T_IQ4_XS ? 136 : t == T_Q4_K ? 144 : t == T_Q5_K ? 176 : t == T_Q5_1 ? 24 : t == T_Q8_0 ? 34
+         : t == T_MXFP4 ? 17 : 18;
 }
 // the formats with a minimum (w = d q + m), and the raw words a sub-block's load stage holds
 __host__ __device__ constexpr bool has_min(int t) { return t == T_Q4_K || t == T_Q5_K || t == T_Q5_1; }
@@ -333,6 +340,10 @@ template <int T, int NW> __device__ __forceinline__ void load_unit(const uint8_t
 #pragma unroll
         for (int k = 0; k < 4; ++k) w[k] = ld32(bp + 2 + 4 * k);
         w[4] = ld16(bp);
+    } else if constexpr (T == T_MXFP4) {   // one 32-value block: an E8M0 scale byte then 16 code bytes
+#pragma unroll
+        for (int k = 0; k < 4; ++k) w[k] = ld32(bp + 1 + 4 * k);
+        w[4] = (uint32_t) bp[0];   // the E8M0 scale byte in the low byte (convert reads it as e - 127)
     } else if constexpr (T == T_Q4_K || T == T_Q5_K) {
         // qs: 32 bytes of the sub-block pair (ib / 2), the nibble chosen in convert; w[8] = d | dmin << 16; w[9]: the
         // scale/min bytes (get_scale_min_k4's: ib < 4: sc[ib], sc[ib + 4]; else sc[ib + 4], sc[ib - 4], sc[ib]), ib << 24
@@ -522,6 +533,13 @@ __device__ __forceinline__ void convert(const uint32_t (&w)[NW], const uint8_t* 
 #pragma unroll
         for (int k = 0; k < 4; ++k) table16(w[k], kv, q[k], q[4 + k]);
         s0 = s1 = T == T_IQ4_XS ? half_at(w[4]) * (float) ((int) (w[4] >> 16) - 32) : half_at(w[4]);
+    } else if constexpr (T == T_MXFP4) {   // E2M1 codes through a 16-entry int8 table; the power-of-two scale is shared
+        // kv holds the eight non-negative E2M1 magnitudes x2 as int8 (so the dot is in halves): 0,1,2,3,4,6,8,12 ->
+        // codes 0..7; bit 3 of a nibble negates. Doubling keeps every product integral; the epilogue halves the sum.
+#pragma unroll
+        for (int k = 0; k < 4; ++k) table16(w[k], kv, q[k], q[4 + k]);
+        const float e = ldexpf(1.0f, (int) w[4] - 127);   // E8M0 block scale, exact (a power of two)
+        s0 = s1 = e * 0.5f;   // undo the x2 above; one scale for both halves (MXFP4 has no per-half split)
     } else {   // Q2_0: code - 1 via a byte table {-1, 0, 1, 2}
 #pragma unroll
         for (int h = 0; h < 4; ++h) {
@@ -970,11 +988,16 @@ native_ws_kernel(const WideBatch b, const NativeGeom geo, const Tables tb, const
     if (tid >= WS_CONS) {
         // ---- producers: weight row ur (both 32-value sub-blocks of a stage), and a share of the activation copies
         const int p = tid - WS_CONS, ur = WS_UPT == 2 ? p : p >> 1, uj0 = WS_UPT == 2 ? 0 : p & 1;
-        uint32_t kv[4] = {0, 0, 0, 0};
-        if constexpr (WT == T_IQ4_XS || WT == T_IQ4_NL) {
+    uint32_t kv[4] = {0, 0, 0, 0};
+    if constexpr (WT == T_IQ4_XS || WT == T_IQ4_NL) {
 #pragma unroll
-            for (int k = 0; k < 16; ++k) kv[k >> 2] |= (uint32_t) (uint8_t) kvalues_iq4nl[k] << (8 * (k & 3));
-        }
+        for (int k = 0; k < 16; ++k) kv[k >> 2] |= (uint32_t) (uint8_t) kvalues_iq4nl[k] << (8 * (k & 3));
+    } else if constexpr (WT == T_MXFP4) {
+        // E2M1's sixteen nibble values (doubled to int8): ggml's kvalues_fp4 = {0,1,2,3,4,6,8,12, 0,-1,-2,-3,-4,-6,-8,-12};
+        // index = nibble (bit 3 selects the negative half), so table16 resolves a byte's two codes in one perm pair.
+#pragma unroll
+        for (int k = 0; k < 16; ++k) kv[k >> 2] |= (uint32_t) (uint8_t) kvalues_fp4[k] << (8 * (k & 3));
+    }
         int q = 0;
         for (int k = 0; k < nmine; ++k) {
             int e, row0, nrows, fb;
@@ -1327,6 +1350,11 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
     if constexpr (WT == T_IQ4_XS || WT == T_IQ4_NL) {
 #pragma unroll
         for (int k = 0; k < 16; ++k) kv[k >> 2] |= (uint32_t) (uint8_t) kvalues_iq4nl[k] << (8 * (k & 3));
+    } else if constexpr (WT == T_MXFP4) {   // the E2M1 magnitudes x2 (integral so the WMMA dot is exact); without
+        // this branch MXFP4 would decode against an all-zero table -> every weight 0 (the GU-only pass was a false
+        // positive: a zeroed MoE still answered the faith prompt).
+#pragma unroll
+        for (int k = 0; k < 16; ++k) kv[k >> 2] |= (uint32_t) (uint8_t) kvalues_fp4[k] << (8 * (k & 3));
     }
     const int ur = tid >> 1, uj = tid & 1;                       // this thread's decode unit: row ur, sub-block uj
     const int t0 = tb.ts[b.e0], nwork = (tb.ts[b.e1] - t0) * NFB;
@@ -1338,10 +1366,12 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
         const uint8_t* wrow = GU ? blob + ((ur & 1) ? geo.up_off : 0) + (size_t) (fb * (NW_ROWS / 2) + (ur >> 1)) * geo.gu_row
                                  : blob + geo.down_off + (size_t) (rbase + ur) * geo.d_row;
         auto unit = [&](int s) -> const uint8_t* {
-            if (GU && WT != T_Q2_0) return wrow + (s >> 2) * BS;   // (Q2_0 gate/up: 64-value blocks, one a stage, like its down)
-            return (WT == T_IQ4_NL || WT == T_Q5_1 || WT == T_Q8_0) ? wrow + (2 * s + uj) * BS : wrow + s * BS;
+            // MXFP4 gate/up rows are NOT super-blocked like the i-quants': the blob holds plain GGUF rows, so a
+            // stage takes two consecutive 32-value blocks of the row (the IQ4_NL rule), not a quarter of a 256-block.
+            if (GU && WT != T_Q2_0 && WT != T_MXFP4) return wrow + (s >> 2) * BS;   // (Q2_0 gate/up: 64-value blocks, one a stage, like its down)
+            return (WT == T_IQ4_NL || WT == T_MXFP4 || WT == T_Q5_1 || WT == T_Q8_0) ? wrow + (2 * s + uj) * BS : wrow + s * BS;
         };
-        auto sub = [&](int s) { return GU && WT != T_Q2_0 ? 2 * (s & 3) + uj : uj; };
+        auto sub = [&](int s) { return GU && WT != T_Q2_0 && WT != T_MXFP4 ? 2 * (s & 3) + uj : uj; };
         auto put = [&](const uint32_t (&raw)[raw_words(WT)], int buf) {
             uint32_t q[8];
             float s0, s1;
@@ -1865,6 +1895,16 @@ bool kq_on() {
     }();
     return on;
 }
+// gfx12: the jamesrogers MXFP4 pack's fused int8 experts (native_w11_kernel<T_MXFP4>).  OPT-IN until measured:
+// STRATA_PF_FUSED_MXFP4=1.  It replaces the folded FP8 path (which is known-bad on long context) with an exact
+// integer-dot GEMM that reads the GGUF's 17-byte MXFP4 blocks directly -- no dequant pass, no E4M3 requantization.
+bool mxfp4_fused_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PF_FUSED_MXFP4");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
 // STRATA_PF_F16=1 (gfx11): the formats native_f16_kernel takes (the K-quants are moe_f16_kq.cu's)
 bool f16_gu(int t) {
     return t == T_IQ2_XXS || t == T_IQ2_XS || t == T_IQ2_S || t == T_IQ3_XXS || t == T_IQ3_S || t == T_IQ4_XS;
@@ -1877,6 +1917,7 @@ bool gu_covered(int t) {
 #endif
 #if defined(__HIPCC__)
            || (t == T_Q2_0 && dev_info().w12)   // gfx12: the native Q2_0 pack's gate/up on native_w11_kernel (64-value blocks)
+           || (t == T_MXFP4 && dev_info().w12)  // gfx12: the jamesrogers MXFP4 pack's gate/up on native_w11_kernel (opt-in STRATA_PF_FUSED_MXFP4)
            || ((t == T_Q4_K || t == T_Q5_K) && kq_on())   // the gfx11 kernels only
 #endif
         ;
@@ -1885,6 +1926,7 @@ bool d_covered(int t) {
     return t == T_Q2_0 || t == T_IQ4_NL
 #if defined(__HIPCC__)
            || ((t == T_Q5_1 || t == T_Q8_0) && kq_on())
+           || (t == T_MXFP4 && dev_info().w12)   // gfx12: the MXFP4 pack's down on native_w11_kernel
 #endif
         ;
 }
@@ -2024,7 +2066,8 @@ bool native_supported(int gu_type, int d_type) {
     // R9700 (p620, IQ3_S, serve, 3 interleaved pairs): prompt 2K +9.7%, 8K +12.2%, 32K +8.8%; first-token KL against the MMQ default 0.017 (29 prompts of
     // 1,025 tokens, top-1 28 of 29), the answers are not the MMQ bytes.  STRATA_PF_FUSED_IQ2S=0 turns it off; STRATA_PF_FUSED=0 turns all fused kernels off.
     if (env < 0 && gu_type != T_IQ3_S && gu_type != T_IQ3_XXS && !(gu_type == T_Q2_0 && strata::core::kGfx12PromptDefaultsOn) &&
-        !(gfx12_iq2s_default() && (gu_type == T_IQ2_S || gu_type == T_IQ4_XS))) return false;
+        !(gfx12_iq2s_default() && (gu_type == T_IQ2_S || gu_type == T_IQ4_XS)) &&
+        !(gu_type == T_MXFP4 && mxfp4_fused_on())) return false;
     const DevInfo& d = dev_info();
     if (!d.ok || !d_covered_on(d_type, d)) return false;
     if (d.t75 && (gu_type != T_Q2_0 || d_type != T_Q2_0)) return false;
@@ -2105,6 +2148,7 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
             case T_IQ3_XXS: STRATA_NW_GU(T_IQ3_XXS); break;
             case T_IQ3_S: STRATA_NW_GU(T_IQ3_S); break;
             case T_Q2_0: STRATA_NW_GU(T_Q2_0); break;
+            case T_MXFP4: STRATA_NW_GU(T_MXFP4); break;
             case T_Q4_K: STRATA_NW_GU(T_Q4_K); break;
             case T_Q5_K: STRATA_NW_GU(T_Q5_K); break;
             default: STRATA_NW_GU(T_IQ4_XS); break;
@@ -2118,6 +2162,7 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
             else STRATA_F16_LAUNCH(T_IQ4_NL, false, f16::D_NFB, ha8, nullptr, dm);
         }
         else if (g.d_type == T_Q2_0) STRATA_NW_D(T_Q2_0);
+        else if (g.d_type == T_MXFP4) { if (occ_d) native_w11_kernel<T_MXFP4, false, true, NW_LB><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); else native_w11_kernel<T_MXFP4, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); }
         else if (g.d_type == T_Q5_1) STRATA_NW_D(T_Q5_1);
         else if (g.d_type == T_Q8_0) STRATA_NW_D(T_Q8_0);
         else STRATA_NW_D(T_IQ4_NL);
