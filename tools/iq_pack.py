@@ -221,7 +221,8 @@ def tensor_bytes(mm, g, t) -> np.ndarray:
 
 
 def is_expert(name: str) -> bool:
-    return name.startswith("blk.") and name.endswith(("_exps.weight",))
+    # blk.48.* is the NextN/MTP head (head-in-file quants like jamesrogers), not a layer: never pack it.
+    return name.startswith("blk.") and name.endswith(("_exps.weight",)) and not name.startswith("blk.48.")
 
 
 def convert(name: str, type_name: str, raw: np.ndarray, compat_bf16: bool):
@@ -277,7 +278,7 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False) -> int:
     reads them (FORM; converted when stored otherwise, see above), quantized ones served natively from the GGUF."""
     todo, problems = [], []
     for name, (g, t, mm, p) in model.where.items():
-        if is_expert(t.name) or t.name in NOT_IN_PACK:
+        if is_expert(t.name) or t.name in NOT_IN_PACK or t.name.startswith("blk.48."):
             continue
         if len(t.shape) > 2:
             print("tensor %s has %d dimensions; the index holds two" % (t.name, len(t.shape)))
@@ -433,7 +434,7 @@ def expert_layout(model: Model, src: pathlib.Path):
     shards do not start their data section at the same byte, so one role's data_start must not be used for
     another's (per-role data_start as in #255, gopinath87607)."""
     T = {n: w[1] for n, w in model.where.items()}
-    exps = [n for n in T if n.startswith("blk.") and n.endswith("_exps.weight")]
+    exps = [n for n in T if n.startswith("blk.") and n.endswith("_exps.weight") and not n.startswith("blk.48.")]
     if not exps:
         return "the model has no expert tensors (blk.N.ffn_{gate,up,down}_exps.weight)"
     n_layers = 1 + max(int(n.split(".")[1]) for n in exps)
@@ -694,7 +695,7 @@ def main() -> int:
         print("warning: %s has no %s, so nothing says it belongs to this model; the engine reads it instead of "
               "the GGUF (rerun with --experts-bin to rewrite it)" % (path, sidecar.name))
     if a.base:
-        if any(w[3] != src for w in model.where.values() if not w[1].name in NOT_IN_PACK):
+        if any(w[3] != src for w in model.where.values() if not w[1].name in NOT_IN_PACK and not w[1].name.startswith("blk.48.")):
             print("--base needs a model whose tensors are all in shard 1")
             return 1
         (out / "native_experts.txt").unlink(missing_ok=True)
