@@ -54,5 +54,13 @@
   "STRATA_PREFILL_CPU_SHARE": "1",
   "STRATA_ROUTE_TAIL_SKIP": "7",
   "STRATA_PF_FUSED_MXFP4": "1"
+ },
+ "vision": {
+  "exe": "/home/nobara-user/build-vision-hip/bin/strata-vision-hip",
+  "mmproj": "/home/nobara-user/Strata-data/models/jamesrogers-mxfp4/mmproj-F16.gguf",
+  "model": "/home/nobara-user/Strata-data/models/jamesrogers-mxfp4/Qwen3.8-Flash-Next-MXFP4-ngramQ8-NextN.gguf",
+  "gpu": false,
+  "threads": 8,
+  "max_tokens": 1280
  }
 }
