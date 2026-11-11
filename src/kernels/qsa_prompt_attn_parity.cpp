@@ -420,8 +420,8 @@ int main(int argc, char** argv) {
     fails += run(1, 2100, std::min<int64_t>(nq, 256), reps);    // the identity-to-sparse edge
     fails += run(3, ctx, nq, reps);                             // q4_sym (decode KV_MODE 5) vs FP64
     fails += run(3, 1500, std::min<int64_t>(nq, 1500), reps);   // q4_sym short context
-    { const char* q4s = std::getenv("STRATA_PA_Q4SYM");
-      if (q4s && q4s[0] == '1') {
+    { const char* q4s = std::getenv("STRATA_PA_Q4SYM");   // S6 is the engine default; opt out with =0
+      if (!(q4s && q4s[0] == '0')) {
           fails += run(4, ctx, nq, reps);                        // q4_sym S6 WMMA: new vs old vs FP64
           fails += run(4, 1500, std::min<int64_t>(nq, 1500), reps);
       } }

@@ -2237,7 +2237,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
 // prompt_attn_wmma_body's structure but handles the fact that a wave's 64-dim slice spans TWO q4 blocks
 // (blocks 2*warp and 2*warp+1), each with its own fp16 scale s = amax/7. Element 2e is the low nibble of
 // byte e and 2e+1 the high one (gufo pairing, NOT ggml j/j+16); codes are signed -8..7 (two's complement).
-// Opt-in via STRATA_PA_Q4SYM (default off): the FP32 scalar fallback stays the default until this is gated on.
+// Default ON; STRATA_PA_Q4SYM=0 opts back out to the FP32 scalar fallback.
 
 // Staging for a chunk's V side: this wave's 64 dims of each cell, expanded to fp16 codes, plus the two
 // block scales (block 2*warp holds dims [dim0,dim0+32), block 2*warp+1 holds [dim0+32,dim0+64)).
@@ -2707,10 +2707,11 @@ bool launch_wmma(const float* q, const QsaAttnPools& pools, const int32_t* ids, 
 #endif
 
 
-// Phase B: q4_sym matrix-core launch (opt-in STRATA_PA_Q4SYM). Mirrors launch_wmma's SPLIT/RPF/TR choices but
-// without the STAT diagnostic or the fused-gate variant (the q4_sym path is A/B-only until it earns a default).
+// Phase B: q4_sym matrix-core launch. Default ON (parity vs FP64 + coherence + needle 6/6 + prefill ~15% faster);
+// STRATA_PA_Q4SYM=0 opts back out to the FP32 scalar fallback. Mirrors launch_wmma's SPLIT/RPF/TR choices but
+// without the STAT diagnostic or the fused-gate variant.
 bool pa_q4sym_on() {
-    static const bool on = [] { const char* e = std::getenv("STRATA_PA_Q4SYM"); return e != nullptr && e[0] == '1'; }();
+    static const bool on = [] { const char* e = std::getenv("STRATA_PA_Q4SYM"); return !(e && e[0] == '0'); }();
     return on;
 }
 template <bool SPLIT, bool RPF, int TR>
