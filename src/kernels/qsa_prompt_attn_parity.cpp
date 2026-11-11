@@ -79,7 +79,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                 std::memcpy(pool->data() + b * B4, &d, 2);
                 for (int j = 0; j < 16; ++j) (*pool)[b * B4 + 2 + j] = (uint8_t) byte(rng);
             }
-    } else if (fmt == 3) {
+    } else if (fmt == 3 || fmt == 4) {
         // q4_sym (block_q4_sym): {fp16 s = amax/7, 16 code bytes}; element 2e in the LOW nibble of byte e, 2e+1 in the
         // HIGH nibble; signed codes -7..7, value = code * s. Positive scale only (amax/7 is a magnitude bound).
         std::uniform_int_distribution<int> sym(-7, 7);
@@ -198,7 +198,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
         }
     }
     k::QsaAttnPools pl;
-    if (fmt == 3) { pl.k_q4 = up(k4); pl.v_q4 = up(v4); pl.kv_q4_sym = true; }
+    if (fmt == 3 || fmt == 4) { pl.k_q4 = up(k4); pl.v_q4 = up(v4); pl.kv_q4_sym = true; }
     else if (fmt == 2) { pl.k_q4 = up(k4); pl.v_q4 = up(v4); }
     else if (fmt == 1) { pl.k_q = up(kq); pl.v_q = up(vq); pl.k_scale = up(ks); pl.v_scale = up(vs); }
     else { pl.k_pool = up(kh); pl.v_pool = up(vh); }
@@ -280,7 +280,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                 const int64_t cell = sel[c], row = ((int64_t) table[cell / PS] * NKV + kvh) * PS + cell % PS;
                 double a = 0;
                 for (int64_t d = 0; d < HD; ++d) {
-                    const double kv = fmt == 3 ? q4symv(k4, row, d)
+                    const double kv = (fmt == 3 || fmt == 4) ? q4symv(k4, row, d)
                                       : fmt == 2 ? q4v(k4, row, d)
                                       : fmt == 1 ? (double) kq[row * HD + d] * h2f(ks[row * 4 + d / 64]) : h2f(kh[row * HD + d]);
                     a += (double) q[(i * NH + h) * HD + d] * kv;
@@ -294,7 +294,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                 double a = 0;
                 for (int64_t c = 0; c < w; ++c) {
                     const int64_t cell = sel[c], row = ((int64_t) table[cell / PS] * NKV + kvh) * PS + cell % PS;
-                    const double vv = fmt == 3 ? q4symv(v4, row, d)
+                    const double vv = (fmt == 3 || fmt == 4) ? q4symv(v4, row, d)
                                       : fmt == 2 ? q4v(v4, row, d)
                                       : fmt == 1 ? (double) vq[row * HD + d] * h2f(vs[row * 4 + d / 64]) : h2f(vh[row * HD + d]);
                     a += sco[c] * vv;
@@ -377,7 +377,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     }
     std::printf("%s %s ctx %lld, %lld queries: vs FP64 old %.3g new %.3g (output scale %.3g); new vs old %.3g (%.2g of "
                 "scale); %.3f -> %.3f ms per chunk (%.2fx); new output checksum %016llx\n",
-                ok1 && ok2 ? "PASS" : "FAIL", fmt == 2 ? "q4_0" : fmt == 1 ? "int8" : "fp16", (long long) ctx, (long long) nq, err_old,
+                ok1 && ok2 ? "PASS" : "FAIL", fmt == 4 ? "q4_sym(S6)" : fmt == 2 ? "q4_0" : fmt == 1 ? "int8" : "fp16", (long long) ctx, (long long) nq, err_old,
                 err_new, ref_scale, diff, diff / scale, ms_old / reps, ms_new / reps, ms_old / ms_new, (unsigned long long) sum);
     cudaFree((void*) d_ids); cudaFree((void*) d_steps); cudaFree((void*) d_q); cudaFree(d_old); cudaFree(d_new);
     cudaFree(scratch);
@@ -420,6 +420,11 @@ int main(int argc, char** argv) {
     fails += run(1, 2100, std::min<int64_t>(nq, 256), reps);    // the identity-to-sparse edge
     fails += run(3, ctx, nq, reps);                             // q4_sym (decode KV_MODE 5) vs FP64
     fails += run(3, 1500, std::min<int64_t>(nq, 1500), reps);   // q4_sym short context
+    { const char* q4s = std::getenv("STRATA_PA_Q4SYM");
+      if (q4s && q4s[0] == '1') {
+          fails += run(4, ctx, nq, reps);                        // q4_sym S6 WMMA: new vs old vs FP64
+          fails += run(4, 1500, std::min<int64_t>(nq, 1500), reps);
+      } }
     std::printf("FAILURES: %d\n", fails);
     return fails;
 }
