@@ -37,6 +37,31 @@ inline uint64_t kv_q4_bytes_per_cell(const QsaShapes& s) {
     return (uint64_t) s.n_head_kv * kv_q4_bytes_per_head((int) s.head_dim) * 2;
 }
 
+/// The symmetric (gufo-style) block: an fp16 scale s = amax/7 and 32 signed 4-bit codes, element 2e in the low
+/// nibble of byte e and 2e+1 in the high one (gufo's blocked-KV packing; NOT ggml's j / j+16 pairing). No rotation:
+/// the per-32-block scale is the outlier bound (`--kv q4_sym`).
+#pragma pack(push, 1)
+struct block_q4_sym {
+    uint16_t s;             // amax / 7 (fp16 bits)
+    uint8_t qs[QK4_0 / 2];  // signed codes -7..7: element 2e low nibble, 2e+1 high nibble
+};
+#pragma pack(pop)
+static_assert(sizeof(block_q4_sym) == 18, "block_q4_sym must be 18 bytes");
+
+/// Bytes per cell and KV head for the symmetric format: identical to q4_0's (8 blocks x 18).
+inline uint64_t kv_q4sym_bytes_per_head(int head_dim) { return (uint64_t) (head_dim / QK4_0) * sizeof(block_q4_sym); }
+
+/// The symmetric append paths (no FWHT anywhere: K/V are stored as quantized directly).
+void kv_append_q4sym_step(uint8_t* k_q, uint8_t* v_q, const int32_t* page_table, const int32_t* step,
+                          const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
+                          const KvHostPools* host = nullptr);
+void kv_append_q4sym_steps(uint8_t* k_q, uint8_t* v_q, const int32_t* page_table, const int32_t* step,
+                           int step_stride, int n_steps, const float* kcur, const float* vcur, const QsaShapes& s,
+                           void* stream, const KvHostPools* host = nullptr);
+void kv_append_q4sym(uint8_t* k_q, uint8_t* v_q, const int32_t* page_table, int64_t pos0, int64_t T, const float* K,
+                     const float* V, const QsaShapes& s, void* stream, const KvHostPools* host = nullptr,
+                     const KvHostPools* stage = nullptr);
+
 /// Orthonormal Fast Walsh-Hadamard Transform of rows of 256 floats (scale 1/16): its own inverse.
 void fwht256_cuda(const float* src, float* dst, int64_t n_rows, void* stream);
 inline void fwht256_inplace_cuda(float* data, int64_t n_rows, void* stream) { fwht256_cuda(data, data, n_rows, stream); }

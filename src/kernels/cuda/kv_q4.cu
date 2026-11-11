@@ -90,6 +90,23 @@ __device__ __forceinline__ uint16_t q4_group(float x, int lane, uint8_t& byte) {
     return f16_from_f32(d);
 }
 
+// The symmetric codec (gufo's blocked KV): s = amax / 7, codes = rint(x / s) clamped to [-7, 7], element 2e in the
+// low nibble of byte e and 2e+1 in the high one. Ties in |x| resolve to the larger value in EVERY lane (as q4_group),
+// so all lanes agree on s.
+__device__ __forceinline__ void q4sym_store(uint8_t* pool, long long row, int b, int lane, float x) {
+    float amax = fabsf(x);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float sc = amax > 0.0f ? amax * (1.0f / 7.0f) : 1.0f;
+    int q = (int) rintf(x / sc);
+    q = q > 7 ? 7 : (q < -7 ? -7 : q);
+    const uint8_t qc = (uint8_t) ((uint32_t) q & 0xFu);
+    const uint8_t qhi = (uint8_t) (__shfl_down_sync(0xffffffffu, qc, 16) & 0xFu);   // element t+16 (same parity lane)
+    block_q4_sym* blk = reinterpret_cast<block_q4_sym*>(pool + row * (long long) sizeof(block_q4_sym) * 8) + b;
+    if (lane == 0) blk->s = f16_from_f32(sc);
+    if (lane < 16) blk->qs[lane] = (uint8_t) (qc | (qhi << 4));
+}
+
 __device__ __forceinline__ void q4_store(uint8_t* pool, long long row, int b, int lane, uint16_t d, uint8_t byte) {
     block_q4_0* blk = reinterpret_cast<block_q4_0*>(pool + row * (long long) sizeof(block_q4_0) * 8) + b;
     if (lane == 0) blk->d = d;
@@ -222,6 +239,70 @@ void kv_append_q4(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, int64
         kv_append_q4_batch_kernel<<<grid, 32, 0, cs>>>(k_q4, v_q4, page_table, pos0, K, V, (int) s.n_head_kv,
                                                        (int) s.head_dim, (int) s.page_size, is_v, h, st);
     check("kv_append_q4 batch launch");
+}
+
+// The symmetric prompt append: one warp per (token, head, block); no rotation upstream.
+__global__ void kv_append_q4sym_batch_kernel(uint8_t* __restrict__ k_q, uint8_t* __restrict__ v_q,
+                                             const int32_t* __restrict__ table, int64_t pos0,
+                                             const float* __restrict__ K, const float* __restrict__ V,
+                                             int kv_heads, int head_dim, int page_size, int is_v_grid,
+                                             KvHostPools host, KvHostPools stage) {
+    const long long t = blockIdx.x;
+    const long long pos = pos0 + t;
+    const int h = blockIdx.y, b = blockIdx.z, th = threadIdx.x;
+    const bool is_v = is_v_grid != 0;
+    const float x = (is_v ? V : K)[t * (kv_heads * head_dim) + h * head_dim + b * QK4_0 + th];
+    const long long page = (long long) __ldg(table + pos / page_size);
+    const long long row_id = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
+    if (page >= 0) q4sym_store(is_v ? v_q : k_q, (page * kv_heads + h) * page_size + (pos % page_size), b, th, x);
+    if (host.k_q4 != nullptr) q4sym_store(is_v ? host.v_q4 : host.k_q4, row_id, b, th, x);
+    if (stage.k_q4 != nullptr) q4sym_store(is_v ? stage.v_q4 : stage.k_q4, row_id, b, th, x);
+}
+
+// One block = one 32-value group of one KV head of K (plane 0) or V (plane 1) for token step[k]; 32 threads.
+__global__ void kv_append_q4sym_kernel(uint8_t* __restrict__ k_q, uint8_t* __restrict__ v_q,
+                                       const int32_t* __restrict__ table, const int32_t* __restrict__ step,
+                                       int step_stride, int planes,
+                                       const float* __restrict__ kcur, const float* __restrict__ vcur,
+                                       int kv_heads, int head_dim, int page_size, KvHostPools host) {
+    const int step_idx = (int) (blockIdx.z / (unsigned) planes);
+    const bool is_v = (blockIdx.z % (unsigned) planes) == 1u;
+    const long long pos = (long long) __ldg(step + (long long) step_idx * step_stride + kStepPos);
+    const int h = blockIdx.x, b = blockIdx.y, t = threadIdx.x;
+    const float x = (is_v ? vcur : kcur)[(long long) step_idx * kv_heads * head_dim + h * head_dim + b * QK4_0 + t];
+    const long long page = (long long) __ldg(table + pos / page_size);
+    if (page >= 0) q4sym_store(is_v ? v_q : k_q, (page * kv_heads + h) * page_size + (pos % page_size), b, t, x);
+    if (host.k_q4 != nullptr) q4sym_store(is_v ? host.v_q4 : host.k_q4, ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size), b, t, x);
+}
+
+void kv_append_q4sym_steps(uint8_t* k_q, uint8_t* v_q, const int32_t* page_table, const int32_t* step,
+                           int step_stride, int n_steps, const float* kcur, const float* vcur, const QsaShapes& s,
+                           void* stream, const KvHostPools* host) {
+    need_256(s, "kv_append_q4sym");
+    const dim3 grid((unsigned) s.n_head_kv, (unsigned) (s.head_dim / QK4_0), (unsigned) (2 * n_steps));
+    kv_append_q4sym_kernel<<<grid, 32, 0, (cudaStream_t) stream>>>(
+        k_q, v_q, page_table, step, step_stride, 2, kcur, vcur, (int) s.n_head_kv, (int) s.head_dim,
+        (int) s.page_size, host ? *host : KvHostPools{});
+    check("kv_append_q4sym launch");
+}
+
+void kv_append_q4sym_step(uint8_t* k_q, uint8_t* v_q, const int32_t* page_table, const int32_t* step,
+                          const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
+                          const KvHostPools* host) {
+    kv_append_q4sym_steps(k_q, v_q, page_table, step, 0, 1, kcur, vcur, s, stream, host);
+}
+
+void kv_append_q4sym(uint8_t* k_q, uint8_t* v_q, const int32_t* page_table, int64_t pos0, int64_t T, const float* K,
+                     const float* V, const QsaShapes& s, void* stream, const KvHostPools* host, const KvHostPools* stage) {
+    if (T <= 0) return;
+    need_256(s, "kv_append_q4sym");
+    const dim3 grid((unsigned) T, (unsigned) s.n_head_kv, (unsigned) (s.head_dim / QK4_0));
+    cudaStream_t cs = (cudaStream_t) stream;
+    const KvHostPools h = host ? *host : KvHostPools{}, st = stage ? *stage : KvHostPools{};
+    for (int is_v = 0; is_v < 2; ++is_v)
+        kv_append_q4sym_batch_kernel<<<grid, 32, 0, cs>>>(k_q, v_q, page_table, pos0, K, V, (int) s.n_head_kv,
+                                                          (int) s.head_dim, (int) s.page_size, is_v, h, st);
+    check("kv_append_q4sym batch launch");
 }
 
 void kv_gather_q4_step(const uint8_t* k_q4, const uint8_t* v_q4, const int32_t* page_table, const int32_t* ids,

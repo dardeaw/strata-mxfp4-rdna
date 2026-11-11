@@ -217,6 +217,9 @@ struct QsaState {
     uint16_t* v_scale = nullptr;
     /// PR #21: Q4_0 KV with Walsh-Hadamard rotation (qsa_set_kv_q4, kv_q4.hpp): 144 B per cell and head
     bool kv_q4 = false;
+    /// The symmetric variant of the Q4 layout (`--kv q4_sym`): block_q4_sym blocks (amax/7 scale, signed nibbles,
+    /// element 2e low / 2e+1 high), stored WITHOUT the Hadamard rotation. Shares every Q4_0 pool and mover.
+    bool kv_q4_sym = false;
     uint8_t* k_q4 = nullptr;
     uint8_t* v_q4 = nullptr;
     /// Hybrid K8V4: K in INT8 (unrotated - the scores stay exact), V in rotated Q4_0 (kv_q4.hpp): 816 B per cell.
@@ -314,6 +317,9 @@ void qsa_set_kv_int8_rotate(bool enabled);
 bool qsa_kv_int8();
 /// PR #21: store K/V as Q4_0 after a Hadamard rotation (`--kv q4_0`): 576 B per cell, vs 1,056 in INT8.
 void qsa_set_kv_q4(bool enabled);
+/// `--kv q4_sym`: the symmetric amax/7 nibble format (block_q4_sym, no rotation): same 144 B per cell and head as
+/// Q4_0 but a plain blocked layout; the RDNA matrix-core prompt attention takes it (KV_MODE 5).
+void qsa_set_kv_q4_sym(bool enabled);
 bool qsa_kv_q4();
 /// Hybrid K8V4 (`--kv k8v4`): K in INT8, V in rotated Q4_0 - 816 B per cell; streams with --kv-resident too.
 void qsa_set_kv_hybrid(bool enabled);
