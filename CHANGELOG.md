@@ -1,5 +1,20 @@
 # Changelog
 
+## Q4 KV performance (fork) — 2026-11-12
+
+Version 0.1.57.
+
+### Performance
+
+- `--kv q4_sym`: prompt attention runs on the gfx12 WMMA matrix cores (S6)
+  instead of the FP32 scalar fallback — 4.4x on the attention kernel, ~15%
+  faster prefill at 16K context (2.85 vs 12.5 ms per 8K-query chunk).
+  `STRATA_PA_Q4SYM=0` restores the old path.
+
+### Changed
+
+- `--kv q4_sym` prompt attention is on by default.
+
 ## MXFP4 for RDNA4 (fork) — 2026-11-05
 
 Fork of [Niko1221/Strata](https://github.com/Niko1221/Strata), based on 0.2.10 +
