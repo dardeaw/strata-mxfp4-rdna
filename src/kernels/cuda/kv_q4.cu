@@ -101,10 +101,13 @@ __device__ __forceinline__ void q4sym_store(uint8_t* pool, long long row, int b,
     int q = (int) rintf(x / sc);
     q = q > 7 ? 7 : (q < -7 ? -7 : q);
     const uint8_t qc = (uint8_t) ((uint32_t) q & 0xFu);
-    const uint8_t qhi = (uint8_t) (__shfl_down_sync(0xffffffffu, qc, 16) & 0xFu);   // element t+16 (same parity lane)
+    // Adjacent pairing (this codec's documented layout, unlike q4_0's t/t+16): element 2e in the LOW nibble of
+    // byte e and 2e+1 in the HIGH one. So a byte pairs lane t with lane t^1 - the neighbour of opposite parity -
+    // and only the even lanes store. Every decoder (load8_q4sym, the S6 body, the parity harness) reads this way.
+    const uint8_t qn = (uint8_t) (__shfl_sync(0xffffffffu, qc, lane ^ 1) & 0xFu);   // the adjacent element (t^1)
     block_q4_sym* blk = reinterpret_cast<block_q4_sym*>(pool + row * (long long) sizeof(block_q4_sym) * 8) + b;
     if (lane == 0) blk->s = f16_from_f32(sc);
-    if (lane < 16) blk->qs[lane] = (uint8_t) (qc | (qhi << 4));
+    if ((lane & 1) == 0) blk->qs[lane / 2] = (uint8_t) (qc | (qn << 4));   // even lane: low = t, high = t+1
 }
 
 __device__ __forceinline__ void q4_store(uint8_t* pool, long long row, int b, int lane, uint16_t d, uint8_t byte) {
