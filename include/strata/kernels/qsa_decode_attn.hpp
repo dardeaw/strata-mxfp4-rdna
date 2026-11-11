@@ -29,6 +29,9 @@ struct QsaAttnPools {
     const uint16_t* v_scale = nullptr;
     const uint8_t* k_q4 = nullptr;      ///< q4_0 block_q4_0 [page][kv_head][page_size][head_dim / 32 * 18]
     const uint8_t* v_q4 = nullptr;
+    /// The k_q4/v_q4 blocks are block_q4_sym (the symmetric amax/7 nibble grid, no rotation) rather than ggml's
+    /// q4_0: another codec over the same geometry (`--kv q4_sym`). Set only when both q4 pointers are non-null.
+    bool kv_q4_sym = false;
     const int32_t* page_table = nullptr;
 };
 

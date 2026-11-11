@@ -40,7 +40,8 @@ template <typename T> T* up(const std::vector<T>& h) {
 float h2f(uint16_t b) { __half h; *reinterpret_cast<uint16_t*>(&h) = b; return __half2float(h); }
 uint16_t f2h(float f) { __half h = __float2half(f); return *reinterpret_cast<uint16_t*>(&h); }
 
-int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2 q4_0
+int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2 q4_0, 3 q4_sym (decode kernel only)
+    const bool decode_only = fmt == 3;   // q4_sym has no tensor-core / S6 prompt kernel yet (Phase B): old IS the path
 #if !defined(__HIPCC__) && !defined(STRATA_USE_HIP)
     if (fmt == 2) {   // mode 4 (Q4_0 KV) runs on sm_80 and newer only: below that the dispatcher keeps the old kernel
         int dev = 0, major = 0;
@@ -77,6 +78,21 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                 const uint16_t d = f2h(sc4(rng));
                 std::memcpy(pool->data() + b * B4, &d, 2);
                 for (int j = 0; j < 16; ++j) (*pool)[b * B4 + 2 + j] = (uint8_t) byte(rng);
+            }
+    } else if (fmt == 3) {
+        // q4_sym (block_q4_sym): {fp16 s = amax/7, 16 code bytes}; element 2e in the LOW nibble of byte e, 2e+1 in the
+        // HIGH nibble; signed codes -7..7, value = code * s. Positive scale only (amax/7 is a magnitude bound).
+        std::uniform_int_distribution<int> sym(-7, 7);
+        std::uniform_real_distribution<float> lg2(std::log(0.01f), std::log(1.0f));
+        k4.resize(rows * ROW4); v4.resize(rows * ROW4);
+        for (auto* pool : {&k4, &v4})
+            for (int64_t b = 0; b < rows * 8; ++b) {
+                const uint16_t sh = f2h(std::exp(lg2(rng)));
+                std::memcpy(pool->data() + b * B4, &sh, 2);
+                for (int j = 0; j < 8; ++j) {   // one byte per pair: low = 2j, high = 2j+1
+                    const int lo = sym(rng) & 0xF, hi = sym(rng) & 0xF;
+                    (*pool)[b * B4 + 2 + j] = (uint8_t) ((hi << 4) | lo);
+                }
             }
     } else if (fmt == 1) {
         kq.resize(rows * HD); vq.resize(rows * HD); ks.resize(rows * 4); vs.resize(rows * 4);
@@ -182,7 +198,8 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
         }
     }
     k::QsaAttnPools pl;
-    if (fmt == 2) { pl.k_q4 = up(k4); pl.v_q4 = up(v4); }
+    if (fmt == 3) { pl.k_q4 = up(k4); pl.v_q4 = up(v4); pl.kv_q4_sym = true; }
+    else if (fmt == 2) { pl.k_q4 = up(k4); pl.v_q4 = up(v4); }
     else if (fmt == 1) { pl.k_q = up(kq); pl.v_q = up(vq); pl.k_scale = up(ks); pl.v_scale = up(vs); }
     else { pl.k_pool = up(kh); pl.v_pool = up(vh); }
     // a q4_0 value: block d / 32 of the row, element j = d % 32 in the low nibble of byte j (j < 16), else the high
@@ -194,6 +211,18 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
         const int j = (int) (d % 32);
         const int code = j < 16 ? (blk[2 + j] & 0x0F) : (blk[2 + j - 16] >> 4);
         return (double) (code - 8) * h2f(sc);
+    };
+    // a q4_sym value: block d / 32, element d % 32 -> pair index (d%32)/2, low nibble for even, high for odd; signed
+    // two's-complement nibble (-8..7 as stored from -7..7) times the block's positive scale s.
+    auto q4symv = [&](const std::vector<uint8_t>& pool, int64_t row, int64_t d) {
+        const uint8_t* blk = pool.data() + row * ROW4 + (d / 32) * B4;
+        uint16_t sc;
+        std::memcpy(&sc, blk, 2);
+        const int rem = (int) (d % 32);
+        const uint8_t byte = blk[2 + rem / 2];
+        const int nib = (rem % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
+        const int signed_code = nib >= 8 ? nib - 16 : nib;   // two's complement of the 4-bit field
+        return (double) signed_code * h2f(sc);
     };
     pl.page_table = up(table);
     const int32_t* d_ids = up(ids);
@@ -226,14 +255,14 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
         if (!ok) { std::fprintf(stderr, "qsa_prompt_attn_batch refused the pools (imma)\n"); std::exit(2); }
     };
     old_run();
-    new_run();
+    if (!decode_only) new_run();
     if (fmt == 1) imma_run();
     ck(cudaDeviceSynchronize(), "run");
-    std::vector<float> o((size_t) (nq * NH * HD)), nw(o.size()), im(fmt == 1 ? o.size() : 0);
+    std::vector<float> o((size_t) (nq * NH * HD)), nw(decode_only ? 0 : (size_t) (nq * NH * HD)), im(fmt == 1 ? o.size() : 0);
     if (fmt == 1) ck(cudaMemcpy(im.data(), d_im, im.size() * 4, cudaMemcpyDeviceToHost), "down");
     ck(cudaMemcpy(o.data(), d_old, o.size() * 4, cudaMemcpyDeviceToHost), "down");
-    ck(cudaMemcpy(nw.data(), d_new, nw.size() * 4, cudaMemcpyDeviceToHost), "down");
-    {   // a hash of the new kernel's output bits (bitwise A/B of two builds / switches)
+    if (!decode_only) { ck(cudaMemcpy(nw.data(), d_new, nw.size() * 4, cudaMemcpyDeviceToHost), "down"); }
+    if (!decode_only) {   // a hash of the new kernel's output bits (bitwise A/B of two builds / switches)
         uint64_t hh = 1469598103934665603ull;
         for (float x : nw) { uint32_t u; std::memcpy(&u, &x, 4); hh = (hh ^ u) * 1099511628211ull; }
         std::printf("NEWHASH %016llx\n", (unsigned long long) hh);
@@ -251,7 +280,8 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                 const int64_t cell = sel[c], row = ((int64_t) table[cell / PS] * NKV + kvh) * PS + cell % PS;
                 double a = 0;
                 for (int64_t d = 0; d < HD; ++d) {
-                    const double kv = fmt == 2 ? q4v(k4, row, d)
+                    const double kv = fmt == 3 ? q4symv(k4, row, d)
+                                      : fmt == 2 ? q4v(k4, row, d)
                                       : fmt == 1 ? (double) kq[row * HD + d] * h2f(ks[row * 4 + d / 64]) : h2f(kh[row * HD + d]);
                     a += (double) q[(i * NH + h) * HD + d] * kv;
                 }
@@ -264,7 +294,8 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                 double a = 0;
                 for (int64_t c = 0; c < w; ++c) {
                     const int64_t cell = sel[c], row = ((int64_t) table[cell / PS] * NKV + kvh) * PS + cell % PS;
-                    const double vv = fmt == 2 ? q4v(v4, row, d)
+                    const double vv = fmt == 3 ? q4symv(v4, row, d)
+                                      : fmt == 2 ? q4v(v4, row, d)
                                       : fmt == 1 ? (double) vq[row * HD + d] * h2f(vs[row * 4 + d / 64]) : h2f(vh[row * HD + d]);
                     a += sco[c] * vv;
                 }
@@ -280,7 +311,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     // 2. new vs old everywhere
     double diff = 0, scale = 0;
     for (size_t i = 0; i < o.size(); ++i) {
-        diff = std::max(diff, (double) std::fabs(o[i] - nw[i]));
+        if (!decode_only) diff = std::max(diff, (double) std::fabs(o[i] - nw[i]));
         scale = std::max(scale, (double) std::fabs(o[i]));
     }
     // 3. speed
@@ -293,11 +324,13 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     cudaEventRecord(e1);
     ck(cudaEventSynchronize(e1), "time");
     cudaEventElapsedTime(&ms_old, e0, e1);
-    cudaEventRecord(e0);
-    for (int r = 0; r < reps; ++r) new_run();
-    cudaEventRecord(e1);
-    ck(cudaEventSynchronize(e1), "time");
-    cudaEventElapsedTime(&ms_new, e0, e1);
+    if (!decode_only) {
+        cudaEventRecord(e0);
+        for (int r = 0; r < reps; ++r) new_run();
+        cudaEventRecord(e1);
+        ck(cudaEventSynchronize(e1), "time");
+        cudaEventElapsedTime(&ms_new, e0, e1);
+    }
     bool ok_im = true;
     if (fmt == 1) {   // the INT8-MMA kernel: the same bounds as v2's, against FP64 and against v2
         double d_iv = 0;
@@ -322,6 +355,18 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     }
     k::qsa_prompt_attn_set_imma(-1);
     cudaFree(d_im);
+    if (decode_only) {   // q4_sym: the decode kernel (KV_MODE 5) is the only path; judge it against FP64 directly
+        const bool ok = err_old <= 1e-4 * std::max(1.0, ref_scale);
+        uint64_t sum = 1469598103934665603ull;
+        for (float f : o) { uint32_t b; std::memcpy(&b, &f, 4); sum = (sum ^ b) * 1099511628211ull; }
+        std::printf("%s q4_sym(decode) ctx %lld, %lld queries: vs FP64 %.3g (output scale %.3g); %.3f ms per chunk; output checksum %016llx\n",
+                    ok ? "PASS" : "FAIL", (long long) ctx, (long long) nq, err_old, ref_scale, ms_old / reps,
+                    (unsigned long long) sum);
+        cudaFree((void*) d_ids); cudaFree((void*) d_steps); cudaFree((void*) d_q); cudaFree(d_old); cudaFree(d_new);
+        cudaFree(scratch);
+        cudaFree((void*) pl.k_q4); cudaFree((void*) pl.v_q4); cudaFree((void*) pl.page_table);
+        return ok ? 0 : 1;
+    }
     const bool ok1 = err_new <= std::max(4.0 * err_old, 1e-6 * ref_scale) && ok_im;
     const bool ok2 = diff <= 1e-4 * scale;
     uint64_t sum = 1469598103934665603ull;   // the new kernel's output bits: two builds of it compare by this
@@ -373,6 +418,8 @@ int main(int argc, char** argv) {
 #endif
     fails += run(1, 1500, std::min<int64_t>(nq, 1500), reps);   // short context: the selection is every cell
     fails += run(1, 2100, std::min<int64_t>(nq, 256), reps);    // the identity-to-sparse edge
+    fails += run(3, ctx, nq, reps);                             // q4_sym (decode KV_MODE 5) vs FP64
+    fails += run(3, 1500, std::min<int64_t>(nq, 1500), reps);   // q4_sym short context
     std::printf("FAILURES: %d\n", fails);
     return fails;
 }
