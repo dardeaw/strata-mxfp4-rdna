@@ -1,5 +1,21 @@
 # Changelog
 
+## Q4_0 Matrix-Core Acceleration & Production Default (fork) — 2026-11-12
+
+Version 0.1.58.
+
+### Performance & Architecture
+- **Production Default**: Default KV storage switched to `--kv q4_0` across CLI (`src/program/generate.cpp`) and default configs (`strata-jamesrogers-mxfp4-nomtp.json`, `configs/mxfp4-rdna-mtp.json`). Halves host RAM & KV memory footprint while matching `int8` MTP acceptance rates.
+- **RDNA4 Matrix-Core (WMMA) Prompt Attention for Q4_0**:
+  - Gated into hardware WMMA path on AMD RDNA4 (gfx12) instead of falling back to scalar loop.
+  - Transposed LDS structure `S.v[4][32][40]` (40-byte stride) reduces LDS footprint from 16 KB to 4.5 KB and eliminates 4-way LDS bank conflicts.
+  - Aligned 8-byte `ds_read_b64` memory loads and on-the-fly fragment unpacking directly in registers (`wh8`), minimizing VGPR pressure and boosting occupancy.
+  - Signed scale correction via `fabsf` achieves bit-level parity against FP64 reference (`FAILURES: 0`).
+- **Benchmark Results**:
+  - Long-context (≥32K) prefill restored from ~1,670 tok/s to **2,469 ~ 2,529 tok/s** (+43%~50% speedup).
+  - 250K cold prefill completed in 105.1 s (2,363.5 tok/s).
+  - 8/8 ReAct agent suite passed with median 63.4 tok/s.
+
 ## Q4 KV performance (fork) — 2026-11-12
 
 Version 0.1.57.

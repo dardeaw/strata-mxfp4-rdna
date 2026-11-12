@@ -18,7 +18,7 @@
   "--max-context",
   "262144",
   "--kv",
-  "int8",
+  "q4_0",
   "--resident-budget-gib",
   "55",
   "--pool-workers",

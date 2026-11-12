@@ -63,32 +63,35 @@ gate selects on RDNA3.
 
 ## Results
 
-Measured with `bench_strata.py` (3 decode reps, prefill 2048..245000), the same
-model and config, `--spec 4` without MTP. Prefill in tok/s:
+Measured with `bench_protocol.py` on AMD Radeon RX 9070 (16 GB, gfx1201, Nobara Linux), running `--kv q4_0` (optimized WMMA matrix-core S6 kernel) with in-file MTP on (`--spec 4`, resident budget 55 GiB, 13 CPU pool workers):
 
-| target | Q4_K_XL | MXFP4-FP16 | MXFP4-FP8 | FP8/FP16 | FP8/Q4 |
-|---:|---:|---:|---:|---:|---:|
-| 2048 | 239.5 | 265.2 | 267.4 | 1.01x | 1.12x |
-| 4096 | 435.8 | 454.5 | 464.9 | 1.02x | 1.07x |
-| 8192 | 629.5 | 783.0 | 789.7 | 1.01x | 1.25x |
-| 16384 | 714.0 | 1192.8 | 1198.5 | 1.00x | 1.68x |
-| 32768 | 822.7 | 1296.9 | 1298.7 | 1.00x | 1.58x |
-| 65536 | 983.3 | 1350.3 | 1363.8 | 1.01x | 1.39x |
-| 131072 | 996.3 | 1344.6 | 1349.1 | 1.00x | 1.35x |
-| 245000 | 621.4 | 1369.8 | 1382.0 | 1.01x | 2.22x |
+### Prefill Ladder (Cold context, unique nonce, max_tokens=1)
 
-Decode (median tok/s):
+| Target Tokens | Actual prompt_n | **Q4_0 (Optimized WMMA)** | Previous int8-fused | Previous folded-FP8 | Speedup vs folded-FP8 | Wall Time |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2,048 | 2,049 | **922.8 tok/s** | 942.2 | 632.3 | +46% | 2.2 s |
+| 4,096 | 4,057 | **1,273.6 tok/s** | 1,277.0 | 1,028.8 | +24% | 3.2 s |
+| 8,192 | 8,233 | **1,940.0 tok/s** | 1,899.2 | 1,489.4 | +30% | 4.3 s |
+| 16,384 | 16,302 | **2,383.6 tok/s** | 2,435.6 | 1,762.1 | +35% | 6.9 s |
+| 32,768 | 32,552 | **2,523.2 tok/s** | 2,477.1 | 1,937.6 | +30% | 12.9 s |
+| 65,536 | 65,210 | **2,469.5 tok/s** | 2,563.4 | 2,035.7 | +21% | 26.5 s |
+| 131,072 | 130,345 | **2,529.6 tok/s** | 2,524.8 | 2,073.7 | +22% | 51.6 s |
+| 250,000 | 248,085 | **2,363.5 tok/s** | 2,367.2 | 2,004.4 | +18% | 105.1 s |
 
-| scenario | Q4_K_XL | MXFP4-FP16 | MXFP4-FP8 | FP8/FP16 |
-|---|---:|---:|---:|---:|
-| short | 18.6 | 24.0 | 23.4 | 0.97x |
-| prose | 23.4 | 32.4 | 32.1 | 0.99x |
-| code | 24.2 | 31.7 | 30.7 | 0.97x |
-| json | 37.2 | 27.3 | 29.2 | 1.07x |
+### Decode Scenarios (Cold KV, MTP spec=4)
 
-`--kv-grow` keeps the GPU at 100% and the CPU near idle (the old
-`--kv-resident 32768` pinning left the CPU at 64.6% and the GPU at 79%). The
-expert cache gets the VRAM the KV does not need.
+| Scenario | Temperature | max_tokens | **Q4_0 tok/s** | MTP Acceptance | int8-fused | folded-FP8 |
+|---|---:|---:|---:|---:|---:|---:|
+| prose | 0.4 | 256 | **39.7** | 53.8% | 38.4 | 38.6 |
+| fib | 0.4 | 256 | **57.8** | 89.4% | 57.3 | 43.8 |
+| json | 0.0 | 128 | **50.2** | 83.0% | 49.0 | 41.4 |
+| code | 0.0 | 128 | **63.6** | 81.7% | 67.6 | 44.1 |
+| repeat | 0.0 | 256 | **61.1** | 87.5% | 49.7 | 48.2 |
+
+### 8-Task ReAct Agent Suite
+- Tool selection accuracy: **8/8 (100%)**
+- Median decode speed: **63.4 tok/s** (range 54.1 – 74.2 tok/s)
+- Long KV tools ladder: All 6 rungs PASS with prefix caching ~0.6 s
 
 ## Quick start
 
