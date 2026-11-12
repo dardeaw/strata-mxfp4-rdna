@@ -413,9 +413,9 @@ int main(int argc, char** argv) {
     fails += run(1, ctx, nq, reps);
 #if !defined(__HIP_PLATFORM_AMD__)
     fails += run(0, ctx, nq, reps);   // FP16 KV: the RDNA4 kernel takes int8 KV only
+#endif
     fails += run(2, ctx, nq, reps);   // Q4_0 KV (mode 4)
     fails += run(2, 1500, std::min<int64_t>(nq, 1500), reps);
-#endif
     fails += run(1, 1500, std::min<int64_t>(nq, 1500), reps);   // short context: the selection is every cell
     fails += run(1, 2100, std::min<int64_t>(nq, 256), reps);    // the identity-to-sparse edge
     fails += run(3, ctx, nq, reps);                             // q4_sym (decode KV_MODE 5) vs FP64
