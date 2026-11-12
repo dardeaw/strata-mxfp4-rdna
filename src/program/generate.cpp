@@ -660,7 +660,7 @@ struct Options {
     int ple_inflight = 256;   // the prompt path reads a chunk's rows at once: 64 left the SSD half idle (32K: 303 -> 189 ms)
     double ple_delay_us = 0;           ///< fault injection: every row read completes no earlier than this
     bool ple_sync_submit = false;      ///< A/B arm: submit reads on the token thread, no I/O worker
-    std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
+    std::string kv = "q4_0";           ///< KV storage (default q4_0): rotated 4-bit, half int8 memory, MTP accept ~= int8
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
     bool kv_grow = false;              ///< the elastic K/V (--kv-grow, STRATA_KV_GROW=1; kvg_ensure)
     std::string dump_residual;
@@ -1029,12 +1029,10 @@ void usage() {
                  "  --ple-inflight N     outstanding SSD reads (default 256)\n"
                  "  --ple-delay-us U     fault injection: each row read completes no earlier than U us\n"
                  "  --ple-sync-submit    A/B arm: submit table reads on the token thread (default: an I/O thread)\n"
-                 "  --kv fp16|int8       KV storage (plan v0.3 P7): int8 codes + fp16 scale per 64 values, half the\n"
-                 "                       VRAM; default fp16 until gate G-C accepts int8\n"
-                 "  --kv q4_0            4-bit K/V after a Hadamard rotation (PR #21): half of int8's memory,\n"
-                 "                       slightly lower precision (see bench/results/2026-09-27-kv-q4)\n"
-                 "  --kv q4_sym          symmetric 4-bit K/V (amax/7 scale per 32, no rotation): same memory as\n"
-                 "                       q4_0; the RDNA4 matrix-core prompt attention takes it (S6 mode 5)\n"
+                 "  --kv fp16|int8|q4_0|q4_sym|k8v4  KV storage (default q4_0): rotated 4-bit K/V\n"
+                 "                       (PR #21, Hadamard rotation): half of int8's memory, MTP accept ~= int8\n"
+                 "                       (see bench/results); fp16 = exact, int8 = per-64 scale, q4_sym =\n"
+                 "                       symmetric 4-bit (S6 mode 5), k8v4 = INT8 K + rotated Q4_0 V\n"
                  "  --kv k8v4            hybrid: INT8 K (exact attention scores) + rotated Q4_0 V, 816 B/cell\n"
                  "                       (vs int8's 1,056); streams with --kv-resident too\n"
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
