@@ -2866,12 +2866,18 @@ __device__ __forceinline__ void prompt_attn_wmma_body_q4(const float* __restrict
                         al[i] = (_Float16) (pv - (float) hi);
                     }
                     const int byte_idx = get_v_byte_idx<IS_SYM>(j, col);
-                    uint64_t v8;
-                    memcpy(&v8, &S.v[warp][byte_idx][cb], 8);
+                    uint64_t v8 = 0;
+                    if constexpr (PA_KL == 8) {
+                        memcpy(&v8, &S.v[warp][byte_idx][cb], 8);
+                    }
                     wh8 b;
 #pragma unroll
                     for (int i = 0; i < PA_KL; ++i) {
-                        uint8_t byte = (uint8_t) (v8 >> (8 * i));
+                        uint8_t byte;
+                        if constexpr (PA_KL == 8)
+                            byte = (uint8_t) (v8 >> (8 * i));
+                        else
+                            byte = S.v[warp][byte_idx][cb + i];
                         b[i] = unpack_v_nibble<IS_SYM>(byte, j, col);
                     }
                     tmp[j] = wmma_f16(ah, b, tmp[j]);
