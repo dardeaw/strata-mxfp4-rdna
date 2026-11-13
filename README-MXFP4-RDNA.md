@@ -198,3 +198,45 @@ drops decode by 35% - keep 13.
 The decode-side GPU hit rate is a misleading target: the learned profile runs at
 56% hits and is faster than a 67%-hit trace-ranked profile, because misses drain
 to the CPU pool and overlap with the serialized GPU hit path.
+
+
+## RDNA3 / RDNA3.5 (gfx11xx) Auto-Detection & Special Configuration
+
+Starting in **v0.1.59**, the engine detects AMD GPU families by `gfx` prefix (`gfx11*` for RDNA3/RDNA3.5, `gfx12*` for RDNA4) and whether the GPU is integrated (UMA) or discrete, applying architecture-specific defaults automatically (`src/core/arch_defaults.cpp`) while preserving any explicit environment variable override.
+
+### Automatic Strategy by GPU Type
+
+| Setting | RDNA4 dGPU (`gfx12*`, e.g. R9700 / RX 9070) | RDNA3 dGPU (`gfx11*`, e.g. RX 7900 XTX / 7800 XT) | RDNA3.5 / RDNA3 iGPU (`gfx11*` UMA, e.g. Strix Halo) |
+|---|---|---|---|
+| MoE Expert Path | FP8 E4M3 WMMA (`STRATA_MXFP4_FP8=1`) | **F16 Matrix-Core Fused** (`STRATA_PF_F16=1` + `STRATA_PF_FUSED_MXFP4=1`) | **F16 Matrix-Core Fused** (`STRATA_PF_F16=1` + `STRATA_PF_FUSED_MXFP4=1`) |
+| Prompt Attention (`--kv q4_0`) | GFX12 WMMA (`trim=2`) | GFX11 WMMA (`STRATA_PA_TRIM=0` default) | GFX11 WMMA (`STRATA_PA_TRIM=0` default) |
+| GDN Recurrence | GFX12 Chunked / Fused | `STRATA_GDN_CHUNKED=1` | `STRATA_GDN_CHUNKED=1` |
+| Dense FP16 Weight Cache | Off (`0`) | Off (`0`, keeps VRAM for `--kv-grow`) | Auto **16384 MiB** (`STRATA_PF_W16_CACHE_MIB=16384`, reserves 8 GiB free) |
+| KV / Expert Memory Policy | `--kv q4_0 --kv-grow --kv-resident 4096` | `--kv q4_0 --kv-grow` | `--kv q4_0 --kv-grow` |
+
+### Special Configuration & Tuning Knobs
+
+1. **Discrete GPUs (RDNA4 & RDNA3 dGPU) — `--kv-grow` Strategy**:
+   - Keep `--kv q4_0 --kv-grow` (and `--kv-resident 4096` on 16–32 GB cards) so KV allocations grow on demand and maximize VRAM available to `--expert-cache auto`.
+   - Leave `STRATA_PF_W16_CACHE_MIB` unset (`0`) on discrete GPUs so the dense FP16 weight cache does not compete with KV or routed experts.
+   - RDNA4 (`gfx12*`) keeps its `STRATA_GFX12_DEFAULTS` table untouched (`STRATA_GFX12_DEFAULTS=0` disables).
+
+2. **Integrated / UMA GPUs (e.g., Strix Halo `gfx1151`, 128 GB unified memory)**:
+   - Recommended flags: `--kv q4_0 --prefill auto:16384 --spec 4 --spec-min-p 0.5 --short-read 64 --mtp-q4 head --mtp-draft-vocab <path>/draft_vocab.bin --kv-grow`.
+   - `STRATA_PF_W16_CACHE_MIB=16384` is auto-enabled when `integrated == true` (`gemm.cu` enforces an 8 GiB free-VRAM reserve). Override with `STRATA_PF_W16_CACHE_MIB=0` to disable or `=N` to set a custom MiB cap.
+   - Keep `STRATA_WMMA_GEMM=0` and `STRATA_PF_HCDOWN=1` (setting `STRATA_WMMA_GEMM=1` or `STRATA_PF_HCDOWN=0` drops 16K prefill from ~1,240 tok/s to ~950 tok/s).
+   - Disable all GFX11 auto-defaults with `STRATA_GFX11_DEFAULTS=0`.
+
+### RDNA3.5 Results (Strix Halo Radeon 8060S, `gfx1151`, DPM `auto`, `--kv q4_0`)
+
+| Prompt Size | Tokens | Prefill (`tok/s`) | Wall Time |
+|---:|---:|---:|---:|
+| 2K | 1,861 | **1,079.6** | 1.76 s |
+| 4K | 3,666 | **1,166.5** | 3.18 s |
+| 8K | 7,286 | **1,219.6** | 6.02 s |
+| 16K | 14,927 | **1,237.9** | 12.10 s |
+| 32K | 29,795 | **1,222.7** | 24.42 s |
+| 65K | 59,746 | **1,218.3** | 49.10 s |
+| 131K | 119,643 | **1,182.9** | 101.23 s |
+
+Decode medians (`--spec 4 --short-read 64 --mtp-q4 head`): `short 37.50`, `prose 37.80`, `code 59.70`, `json 62.40`, `repeat 79.20`, `fib 63.30 tok/s`.

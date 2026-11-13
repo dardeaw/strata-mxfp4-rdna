@@ -301,7 +301,7 @@ __global__ void __launch_bounds__(128) block_scores_tc_kernel(const float* __res
 // gfx11 (RDNA3 / RDNA3.5) has the same instruction with another fragment layout: a lane holds all 16 k of its row
 // (A) or column (B) - lanes 16..31 repeat lanes 0..15 - and D[2i + l/16][l%16]; SEL_KL is the k per lane, SEL_KOFF(g)
 // the first, SEL_ROW(i, g) the D row of element i.  Same products, same order per element as on gfx12.
-#if defined(__gfx1200__) || defined(__gfx1201__)
+#if defined(__GFX12__)
 #define STRATA_SEL_GFX12 1
 #define STRATA_SEL_GFX11 0
 #elif defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || \

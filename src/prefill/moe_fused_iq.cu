@@ -611,6 +611,9 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
     if constexpr (WT == T_IQ4_XS || WT == T_IQ4_NL) {
 #pragma unroll
         for (int k = 0; k < 16; ++k) kv[k >> 2] |= (uint32_t) (uint8_t) kvalues_iq4nl[k] << (8 * (k & 3));
+    } else if constexpr (WT == T_MXFP4) {
+#pragma unroll
+        for (int k = 0; k < 16; ++k) kv[k >> 2] |= (uint32_t) (uint8_t) kvalues_fp4[k] << (8 * (k & 3));
     }
     // Local weight rows: m tile i of warp wf is rows 64 wf + 16 i.. (mma rows g and g + 8: rows +g and +8+g).  For
     // gate/up a tile is 8 features, its gate rows then its up rows, so a lane holds gate and up of one feature.  The
@@ -1618,6 +1621,9 @@ native_f16_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
     if constexpr (WT == T_IQ4_XS || WT == T_IQ4_NL) {
 #pragma unroll
         for (int k = 0; k < 16; ++k) kv[k >> 2] |= (uint32_t) (uint8_t) kvalues_iq4nl[k] << (8 * (k & 3));
+    } else if constexpr (WT == T_MXFP4) {
+#pragma unroll
+        for (int k = 0; k < 16; ++k) kv[k >> 2] |= (uint32_t) (uint8_t) kvalues_fp4[k] << (8 * (k & 3));
     }
     const int live_tiles = (nrows + 15) / 16;
     const uint8_t* blob = b.blob[e - b.e0];
@@ -1628,10 +1634,10 @@ native_f16_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
     const uint8_t* wrow = GU ? blob + (ur >= 64 ? geo.up_off : 0) + (size_t) (fb * 64 + (ur & 63)) * geo.gu_row
                              : blob + geo.down_off + (size_t) (fb * ROWS + ur) * geo.d_row;
     const auto unit = [&](int s) -> const uint8_t* {
-        if (GU) return wrow + (s >> 2) * BS;
-        return (WT == T_IQ4_NL || WT == T_Q8_0) ? wrow + (2 * s + uj) * BS : wrow + s * BS;
+        if (GU && WT != T_MXFP4) return wrow + (s >> 2) * BS;
+        return (WT == T_IQ4_NL || WT == T_Q8_0 || WT == T_MXFP4) ? wrow + (2 * s + uj) * BS : wrow + s * BS;
     };
-    const auto sub = [&](int s) { return GU ? 2 * (s & 3) + uj : uj; };
+    const auto sub = [&](int s) { return (GU && WT != T_MXFP4) ? 2 * (s & 3) + uj : uj; };
     uint32_t raw[RW];
     ActStage<BN> as;
     as.init(act, GU ? GU_ACT_LD : H_LD, srow, tid);
@@ -1644,6 +1650,7 @@ native_f16_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
         uint32_t q[8];
         float s0, s1;
         convert<WT, RW>(raw, sgrid, kv, q, s0, s1, ssign);
+        if constexpr (WT == T_MXFP4) { s0 *= 64.0f; s1 *= 64.0f; }
         uint4* d = reinterpret_cast<uint4*>(s_w + ur * WLD8 + 32 * uj);
         d[0] = make_uint4(q[0], q[1], q[2], q[3]);
         d[1] = make_uint4(q[4], q[5], q[6], q[7]);
@@ -1688,6 +1695,10 @@ native_f16_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
         if (s + 1 < NS) fetch_stage(s + 1);
         compute_stage();
         __syncthreads();
+    }
+    if constexpr (WT == T_MXFP4) {
+#pragma unroll
+        for (int j = 0; j < BN / 16; ++j) acc[j] *= 0.015625f;
     }
     if constexpr (GU) gu_epilogue<BN>(acc, lds, tid, live_tiles, nrows, row0, fb, out);
     else down_epilogue<BN>(acc, lds, tid, live_tiles, nrows, row0, fb, dm);
@@ -1907,9 +1918,9 @@ bool mxfp4_fused_on() {
 }
 // STRATA_PF_F16=1 (gfx11): the formats native_f16_kernel takes (the K-quants are moe_f16_kq.cu's)
 bool f16_gu(int t) {
-    return t == T_IQ2_XXS || t == T_IQ2_XS || t == T_IQ2_S || t == T_IQ3_XXS || t == T_IQ3_S || t == T_IQ4_XS;
+    return t == T_IQ2_XXS || t == T_IQ2_XS || t == T_IQ2_S || t == T_IQ3_XXS || t == T_IQ3_S || t == T_IQ4_XS || (t == T_MXFP4 && mxfp4_fused_on());
 }
-bool f16_d(int t) { return t == T_Q2_0 || t == T_IQ4_NL || t == T_Q8_0; }
+bool f16_d(int t) { return t == T_Q2_0 || t == T_IQ4_NL || t == T_Q8_0 || (t == T_MXFP4 && mxfp4_fused_on()); }
 bool gu_covered(int t) {
     return t == T_IQ2_XXS || t == T_IQ2_XS || t == T_IQ2_S || t == T_IQ3_XXS || t == T_IQ3_S || t == T_IQ4_XS
 #if !defined(__HIPCC__)
@@ -1917,7 +1928,7 @@ bool gu_covered(int t) {
 #endif
 #if defined(__HIPCC__)
            || (t == T_Q2_0 && dev_info().w12)   // gfx12: the native Q2_0 pack's gate/up on native_w11_kernel (64-value blocks)
-           || (t == T_MXFP4 && dev_info().w12)  // gfx12: the jamesrogers MXFP4 pack's gate/up on native_w11_kernel (opt-in STRATA_PF_FUSED_MXFP4)
+           || (t == T_MXFP4 && (dev_info().w12 || (f16::requested() && mxfp4_fused_on())))  // gfx12 w11 or gfx11 F16 (STRATA_PF_F16=1)
            || ((t == T_Q4_K || t == T_Q5_K) && kq_on())   // the gfx11 kernels only
 #endif
         ;
@@ -1950,6 +1961,7 @@ bool q8d_f16_default(const DevInfo& d) {
 bool d_covered_on(int t, const DevInfo& d) {
 #if defined(__HIPCC__)
     if (t == T_Q8_0 && !d.w12 && (f16::requested() || q8d_f16_default(d))) return true;
+    if (t == T_MXFP4 && !d.w12 && f16::requested() && mxfp4_fused_on()) return true;
 #endif
     (void) d;
     return d_covered(t);
@@ -2137,6 +2149,7 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
                 case T_IQ2_S: STRATA_F16_GU(T_IQ2_S); break;
                 case T_IQ3_XXS: STRATA_F16_GU(T_IQ3_XXS); break;
                 case T_IQ3_S: STRATA_F16_GU(T_IQ3_S); break;
+                case T_MXFP4: STRATA_F16_GU(T_MXFP4); break;
                 default: STRATA_F16_GU(T_IQ4_XS); break;
             }
 #undef STRATA_F16_GU
@@ -2159,6 +2172,7 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
         else if ((f16 && f16_d(g.d_type)) || f16_q8d) {
             if (g.d_type == T_Q2_0) STRATA_F16_LAUNCH(T_Q2_0, false, f16::D_NFB, ha8, nullptr, dm);
             else if (g.d_type == T_Q8_0) STRATA_F16_LAUNCH(T_Q8_0, false, f16::D_NFB, ha8, nullptr, dm);
+            else if (g.d_type == T_MXFP4) STRATA_F16_LAUNCH(T_MXFP4, false, f16::D_NFB, ha8, nullptr, dm);
             else STRATA_F16_LAUNCH(T_IQ4_NL, false, f16::D_NFB, ha8, nullptr, dm);
         }
         else if (g.d_type == T_Q2_0) STRATA_NW_D(T_Q2_0);

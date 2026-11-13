@@ -16,14 +16,14 @@
 
 #include <cstring>
 
-#if defined(__HIPCC__)
+#if defined(__HIPCC__) && (defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1250__))
 #define STRATA_FOLDED_WMMA 1
 #else
 #define STRATA_FOLDED_WMMA 0
 #endif
 
-#if STRATA_FOLDED_WMMA
 namespace strata::prefill {
+#if STRATA_FOLDED_WMMA
 namespace {
 
 typedef float floatx8 __attribute__((ext_vector_type(8)));
@@ -215,6 +215,7 @@ bool gfx12_ok() {
 }
 
 }  // namespace
+#endif
 
 bool mxfp4_folded_wref(const uint8_t* gate, const uint8_t* up, const uint8_t* down, uint8_t* wref,
                        int64_t N, int64_t K, bool gu, void* stream) {
@@ -264,4 +265,3 @@ bool mxfp4_folded_d(const uint8_t* X, const uint8_t* down, const uint8_t* wref, 
 }
 
 }  // namespace strata::prefill
-#endif

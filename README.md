@@ -1,4 +1,4 @@
-> **MXFP4 for RDNA4 (this fork).** This fork adds the MXFP4 (E2M1/E8M0) expert path and the FP8 (E4M3) W4A8 compute for AMD **RDNA4 / gfx12**; on **RDNA3 / gfx11xx** (and any GPU without FP8 WMMA) it automatically falls back to **FP16 compute**. The `--kv-grow` expert-cache configuration is the default. See [README-MXFP4-RDNA.md](README-MXFP4-RDNA.md) and [CHANGELOG.md](CHANGELOG.md). This is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata); it is unrelated to gufo, MBufo and halogen.
+> **MXFP4 for RDNA3 & RDNA4 (this fork).** This fork adds the MXFP4 (E2M1/E8M0) expert path with FP8 (E4M3) W4A8 compute for AMD **RDNA4 / gfx12** and **F16 matrix-core fused compute** (`native_f16_kernel<T_MXFP4>`) + Q4_0 WMMA prompt attention for **RDNA3 / RDNA3.5 (gfx11)**. Architecture family (`gfx11*` vs `gfx12*`) and UMA vs discrete GPU `--kv-grow` strategies are detected automatically. See [README-MXFP4-RDNA.md](README-MXFP4-RDNA.md) and [CHANGELOG.md](CHANGELOG.md). This is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata); it is unrelated to gufo, MBufo and halogen.
 
 <p align="center">
   <picture>

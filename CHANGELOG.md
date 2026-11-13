@@ -1,5 +1,29 @@
 # Changelog
 
+## RDNA3 (GFX11) Auto-Defaults, MXFP4 F16 Fused Experts & Q4_0 Prompt Attention (fork) — 2026-11-13
+
+Version 0.1.59.
+
+### Architecture & Auto-Detection
+- **Family-Prefix AMD Detection (`include/strata/kernels/gfx_arch.hpp`, `src/core/arch_defaults.cpp`)**:
+  - Replaced hardcoded `gfx1151` checks across kernels and startup defaults with prefix matching (`gfx11*` for RDNA3/RDNA3.5, `gfx12*` for RDNA4).
+  - Automatically applies verified GFX11 prompt + decode tuning (`STRATA_PF_F16=1`, `STRATA_PF_FUSED=1`, `STRATA_PF_FUSED_MXFP4=1`, `STRATA_GDN_CHUNKED=1`, `STRATA_PA_TRIM=0`, `STRATA_SH_STREAM=0`, etc.) without overwriting user-specified environment variables.
+  - Preserves RDNA4 (`gfx12*`) defaults and discrete-GPU `--kv-grow` / `--kv-resident` memory strategy untouched.
+  - Integrated GFX11 UMA GPUs (`integrated == true`) automatically enable `STRATA_PF_W16_CACHE_MIB=16384` (with an 8 GiB free-VRAM safety reserve), while discrete GPUs keep it off (`0`) to reserve VRAM for `--kv-grow` and `--expert-cache`.
+
+### Performance & Bug Fixes
+- **GFX11 `native_f16_kernel<T_MXFP4>` (`src/prefill/moe_fused_iq.cu`)**:
+  - Enabled `T_MXFP4` in `gu_covered` and `d_covered_on` on GFX11 when `STRATA_PF_F16=1` and `STRATA_PF_FUSED_MXFP4=1`.
+  - Fixed `kvalues_fp4` lookup-table initialization in `native_f16_kernel` and added 64x FP16 scale compensation to prevent subnormal underflow on E8M0 block scales.
+- **GFX11 Q4_0 Prompt Attention (`src/kernels/cuda/qsa_prompt_attn.cu`)**:
+  - Fixed GFX11 Q4 WMMA bug and defaulted `PA_TRIM=0` on `hip_wmma_arch(dev) == 1` (`hip_prompt_attn_wmma`: `FAILURES: 0`, `2.61x` speedup on `q4_0 ctx 1500`).
+- **HIP Padded FP16 Dense Weight Cache (`src/prefill/gemm.cu`)**:
+  - Added `STRATA_PF_W16_CACHE_MIB` support to the HIP padded `Gemm::native` path (`ldw = K + 64`), eliminating repeated dense-weight dequantization across chunks and prompts.
+
+### Benchmark Results (Strix Halo Radeon 8060S, `gfx1151`, DPM `auto`, `--kv q4_0`)
+- **Prefill Ladder**: 2K **1,079.6** | 4K **1,166.5** | 8K **1,219.6** | 16K **1,237.9** | 32K **1,222.7** | 65K **1,218.3** | 131K **1,182.9 tok/s**.
+- **Decode (Median of 3, `--spec 4 --short-read 64 --mtp-q4 head`)**: short **37.50** | prose **37.80** | code **59.70** | json **62.40** | repeat **79.20** | fib **63.30 tok/s**.
+
 ## Q4_0 Matrix-Core Acceleration & Production Default (fork) — 2026-11-12
 
 Version 0.1.58.
