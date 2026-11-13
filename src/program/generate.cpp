@@ -3733,7 +3733,7 @@ int main(int argc, char** argv) {
             // gfx1151 on Windows (#1630 capped a bare `--prefill auto` at 6144 for a 7900 XTX's commit charge): the Strix Halo has its
             // 8192 chunk back.  IQ3_S, 8K prompt: 691 -> 787 tok/s (one chunk streams 1,785 experts instead of 2,782), 64K 713 -> 748;
             // 4K is one chunk already.  STRATA_GFX1151_CHUNK=0 (or STRATA_GFX1151_DEFAULTS=0) keeps 6144.
-            if (win_host && all_igpu && o.prefill_auto_bare && o.prefill_auto_cap > 0 && std::strncmp(ad.gcnArchName, "gfx1151", 7) == 0) {
+            if (all_igpu && o.prefill_auto_bare && o.prefill_auto_cap > 0 && std::strncmp(ad.gcnArchName, "gfx1151", 7) == 0) {
                 const char* c1 = std::getenv("STRATA_GFX1151_CHUNK");
                 const char* d1 = std::getenv("STRATA_GFX1151_DEFAULTS");
                 if (!(c1 != nullptr && c1[0] == '0') && !(d1 != nullptr && d1[0] == '0')) {
@@ -3753,7 +3753,7 @@ int main(int argc, char** argv) {
             // (24,576 slots) and the prompt reads VRAM only; the buffers' VRAM is reserved up front instead (the cache
             // still fits: 46.84 GiB of experts against a 63.6 GB carve-out).  STRATA_PREFILL_BORROW=1 keeps 0.2.7's
             // lending, STRATA_GFX1151_DEFAULTS=0 turns the whole gfx1151 block off.
-            if (win_host && all_igpu && std::strncmp(ad.gcnArchName, "gfx1151", 7) == 0) {
+            if (all_igpu && std::strncmp(ad.gcnArchName, "gfx1151", 7) == 0) {
                 const char* pb = std::getenv("STRATA_PREFILL_BORROW");
                 const char* pd = std::getenv("STRATA_GFX1151_DEFAULTS");
                 if (!(pb != nullptr && pb[0] == '1') && !(pd != nullptr && pd[0] == '0')) {
@@ -3792,7 +3792,7 @@ int main(int argc, char** argv) {
         const char* d0 = std::getenv("STRATA_GFX12_DEFAULTS");
         cudaDeviceProp cp{};
         if (!(c0 != nullptr && c0[0] == '0') && !(d0 != nullptr && d0[0] == '0') &&
-            cudaGetDeviceProperties(&cp, 0) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(cp.gcnArchName)) {
+            cudaGetDeviceProperties(&cp, 0) == cudaSuccess && (strata::kernels::gfx_arch_is_gfx12(cp.gcnArchName) || strata::kernels::gfx_arch_is_gfx11(cp.gcnArchName))) {
             o.prefill_auto_max = 16384;
             o.prefill_chunk = 16384;
             o.prefill_gfx12_16k = true;

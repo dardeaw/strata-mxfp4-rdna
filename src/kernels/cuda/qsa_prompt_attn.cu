@@ -1893,11 +1893,10 @@ bool launch70(const float*, const QsaAttnPools&, const int32_t*, const int32_t*,
 // gfx11 (RDNA3 / RDNA3.5: gfx110x, gfx115x) has the same instruction with another layout: A lane l holds all 16 k of
 // row l % 16 (lanes 16..31 repeat lanes 0..15), B lane l all 16 k of column l % 16, and C/D lane l holds
 // D[2 * i + l / 16][l % 16]. PA_KL is the k values per lane (8 or 16), PA_KOFF(half) the first one, PA_ROW the C row.
-#if defined(__gfx1200__) || defined(__gfx1201__)
+#if defined(__GFX12__)
 #define STRATA_PA_WMMA 1
 #define STRATA_PA_GFX11 0
-#elif defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || \
-    defined(__gfx1151__)
+#elif defined(__GFX11__)
 #define STRATA_PA_WMMA 1
 #define STRATA_PA_GFX11 1
 #else
@@ -2357,7 +2356,11 @@ __device__ __forceinline__ void prompt_attn_wmma_body_q4(const float* __restrict
         uint8_t v[32];        // this wave's 64 V codes (raw 32B), for the p.v B-fragments
         float vs2[2];         // the two V block scales (block 2*warp, 2*warp+1)
         float ksc[2][2];      // per tile nt: the two K block scales
+#if STRATA_PA_GFX11
+        uint4 kq[2][2];       // per tile nt, per block (0,1): full 16 bytes of K
+#else
         uint64_t kq[2][2];    // per tile nt, per block (0,1): raw 8 bytes of K
+#endif
     };
     auto fetch = [&](long long row, ChunkQ& d) {
         d.row = row;
@@ -2397,6 +2400,10 @@ __device__ __forceinline__ void prompt_attn_wmma_body_q4(const float* __restrict
                 if constexpr (IS_SYM) {
                     const block_q4_sym* kb0 = reinterpret_cast<const block_q4_sym*>(p.k_q4 + rr * BYTES) + blk0;
                     const block_q4_sym* kb1 = kb0 + 1;
+#if STRATA_PA_GFX11
+                    memcpy(&d.kq[nt][0], kb0->qs, 16);
+                    memcpy(&d.kq[nt][1], kb1->qs, 16);
+#else
                     const uint8_t* q0 = kb0->qs + (half ? 4 : 0);
                     const uint8_t* q1 = kb1->qs + (half ? 4 : 0);
                     uint32_t a0, a1, b0, b1;
@@ -2404,21 +2411,32 @@ __device__ __forceinline__ void prompt_attn_wmma_body_q4(const float* __restrict
                     memcpy(&b0, q1, 4); memcpy(&b1, q1 + 8, 4);
                     d.kq[nt][0] = ((uint64_t) a1 << 32) | a0;
                     d.kq[nt][1] = ((uint64_t) b1 << 32) | b0;
+#endif
                     d.ksc[nt][0] = __half2float(__ushort_as_half(kb0->s));
                     d.ksc[nt][1] = __half2float(__ushort_as_half(kb1->s));
                 } else {
                     const block_q4_0* kb0 = reinterpret_cast<const block_q4_0*>(p.k_q4 + rr * BYTES) + blk0;
                     const block_q4_0* kb1 = kb0 + 1;
+#if STRATA_PA_GFX11
+                    memcpy(&d.kq[nt][0], kb0->qs, 16);
+                    memcpy(&d.kq[nt][1], kb1->qs, 16);
+#else
                     const uint8_t* q0 = kb0->qs + (half ? 8 : 0);
                     const uint8_t* q1 = kb1->qs + (half ? 8 : 0);
                     memcpy(&d.kq[nt][0], q0, 8);
                     memcpy(&d.kq[nt][1], q1, 8);
+#endif
                     d.ksc[nt][0] = __half2float(__ushort_as_half(kb0->d));
                     d.ksc[nt][1] = __half2float(__ushort_as_half(kb1->d));
                 }
             } else {
                 d.ksc[nt][0] = d.ksc[nt][1] = 0.0f;
+#if STRATA_PA_GFX11
+                d.kq[nt][0] = make_uint4(0, 0, 0, 0);
+                d.kq[nt][1] = make_uint4(0, 0, 0, 0);
+#else
                 d.kq[nt][0] = d.kq[nt][1] = 0;
+#endif
             }
         }
     };
@@ -2438,6 +2456,26 @@ __device__ __forceinline__ void prompt_attn_wmma_body_q4(const float* __restrict
             wf8 sb = wf8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
             wh8 b0, b1, b2, b3;
             if constexpr (IS_SYM) {
+#if STRATA_PA_GFX11
+                const uint32_t k0[4] = {cd.kq[nt][0].x, cd.kq[nt][0].y, cd.kq[nt][0].z, cd.kq[nt][0].w};
+                const uint32_t k1[4] = {cd.kq[nt][1].x, cd.kq[nt][1].y, cd.kq[nt][1].z, cd.kq[nt][1].w};
+#pragma unroll
+                for (int w = 0; w < 2; ++w) {
+#pragma unroll
+                    for (int m = 0; m < 4; ++m) {
+                        uint8_t by0 = (uint8_t) (k0[w] >> (8 * m)), by1 = (uint8_t) (k0[2 + w] >> (8 * m));
+                        uint8_t by2 = (uint8_t) (k1[w] >> (8 * m)), by3 = (uint8_t) (k1[2 + w] >> (8 * m));
+                        int n0 = by0 & 0x0F, n1 = by0 >> 4;
+                        b0[w * 8 + 2 * m] = (_Float16) (n0 >= 8 ? n0 - 16 : n0); b0[w * 8 + 2 * m + 1] = (_Float16) (n1 >= 8 ? n1 - 16 : n1);
+                        n0 = by1 & 0x0F; n1 = by1 >> 4;
+                        b1[w * 8 + 2 * m] = (_Float16) (n0 >= 8 ? n0 - 16 : n0); b1[w * 8 + 2 * m + 1] = (_Float16) (n1 >= 8 ? n1 - 16 : n1);
+                        n0 = by2 & 0x0F; n1 = by2 >> 4;
+                        b2[w * 8 + 2 * m] = (_Float16) (n0 >= 8 ? n0 - 16 : n0); b2[w * 8 + 2 * m + 1] = (_Float16) (n1 >= 8 ? n1 - 16 : n1);
+                        n0 = by3 & 0x0F; n1 = by3 >> 4;
+                        b3[w * 8 + 2 * m] = (_Float16) (n0 >= 8 ? n0 - 16 : n0); b3[w * 8 + 2 * m + 1] = (_Float16) (n1 >= 8 ? n1 - 16 : n1);
+                    }
+                }
+#else
                 uint32_t a0 = (uint32_t) cd.kq[nt][0], a1 = (uint32_t) (cd.kq[nt][0] >> 32);
                 uint32_t b_0 = (uint32_t) cd.kq[nt][1], b_1 = (uint32_t) (cd.kq[nt][1] >> 32);
 #pragma unroll
@@ -2453,7 +2491,23 @@ __device__ __forceinline__ void prompt_attn_wmma_body_q4(const float* __restrict
                     n0 = by3 & 0x0F; n1 = by3 >> 4;
                     b3[2 * m] = (_Float16) (n0 >= 8 ? n0 - 16 : n0); b3[2 * m + 1] = (_Float16) (n1 >= 8 ? n1 - 16 : n1);
                 }
+#endif
             } else {
+#if STRATA_PA_GFX11
+                const uint32_t k0[4] = {cd.kq[nt][0].x, cd.kq[nt][0].y, cd.kq[nt][0].z, cd.kq[nt][0].w};
+                const uint32_t k1[4] = {cd.kq[nt][1].x, cd.kq[nt][1].y, cd.kq[nt][1].z, cd.kq[nt][1].w};
+#pragma unroll
+                for (int w = 0; w < 4; ++w) {
+#pragma unroll
+                    for (int m = 0; m < 4; ++m) {
+                        uint8_t by0 = (uint8_t) (k0[w] >> (8 * m)), by1 = (uint8_t) (k1[w] >> (8 * m));
+                        b0[w * 4 + m] = (_Float16) ((int)(by0 & 0x0F) - 8);
+                        b1[w * 4 + m] = (_Float16) ((int)(by0 >> 4) - 8);
+                        b2[w * 4 + m] = (_Float16) ((int)(by1 & 0x0F) - 8);
+                        b3[w * 4 + m] = (_Float16) ((int)(by1 >> 4) - 8);
+                    }
+                }
+#else
                 uint64_t w0 = cd.kq[nt][0], w1 = cd.kq[nt][1];
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
@@ -2463,6 +2517,7 @@ __device__ __forceinline__ void prompt_attn_wmma_body_q4(const float* __restrict
                     b2[i] = (_Float16) ((int)(by1 & 0x0F) - 8);
                     b3[i] = (_Float16) ((int)(by1 >> 4) - 8);
                 }
+#endif
             }
             sa = wmma_f16(qh[0], b0, sa); if constexpr (SPLIT) sa = wmma_f16(ql[0], b0, sa);
             sa = wmma_f16(qh[1], b1, sa); if constexpr (SPLIT) sa = wmma_f16(ql[1], b1, sa);
@@ -2542,13 +2597,10 @@ __device__ __forceinline__ void prompt_attn_wmma_body_q4(const float* __restrict
                         al[i] = (_Float16) (pv - (float) hi);
                     }
                     const int byte_idx = get_v_byte_idx<IS_SYM>(j, col);
-                    uint64_t v8;
-                    memcpy(&v8, &S.v[warp][byte_idx][cb], 8);
                     wh8 b;
 #pragma unroll
                     for (int i = 0; i < PA_KL; ++i) {
-                        uint8_t byte = (uint8_t) (v8 >> (8 * i));
-                        b[i] = unpack_v_nibble<IS_SYM>(byte, j, col);
+                        b[i] = unpack_v_nibble<IS_SYM>(S.v[warp][byte_idx][cb + i], j, col);
                     }
                     tmp[j] = wmma_f16(ah, b, tmp[j]);
                     if constexpr (SPLIT) tmp[j] = wmma_f16(al, b, tmp[j]);
@@ -2688,7 +2740,13 @@ constexpr int PA_TRIM_DEFAULT = 2;
 template <bool SPLIT, bool GATE>
 void pa_launch(dim3 grid, cudaStream_t st, const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                int n_kv_heads, int page_size, float scale_log2, float* attn, int cap, const float* qf, uint16_t* o16, int64_t ld16) {
-    static const int trim = [] { const char* e = std::getenv("STRATA_PA_TRIM"); return e != nullptr && e[0] != '\0' ? std::atoi(e) : PA_TRIM_DEFAULT; }();
+    static const int trim = [] {
+        const char* e = std::getenv("STRATA_PA_TRIM");
+        if (e != nullptr && e[0] != '\0') return std::atoi(e);
+        int dev = 0;
+        if (hipGetDevice(&dev) == hipSuccess && hip_wmma_arch(dev) == 1) return 0;
+        return PA_TRIM_DEFAULT;
+    }();
     static const bool rpf = [] { const char* e = std::getenv("STRATA_PA_RPF"); return !(e != nullptr && e[0] == '0'); }();
 #define STRATA_PA_L(R, T) prompt_attn_wmma_kernel<SPLIT, GATE, R, T><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, n_kv_heads, page_size, scale_log2, attn, cap, qf, o16, ld16)
     if (trim >= 2) { if (rpf) STRATA_PA_L(true, 2); else STRATA_PA_L(false, 2); }

@@ -1050,7 +1050,7 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
     // hipBLASLt; it returns false for shapes it does not take (and off gfx11) and this falls through
     static const bool wmma_on = [] { const char* v = std::getenv("STRATA_WMMA_GEMM"); return v && v[0] != 0 && v[0] != '0'; }();
     static const bool bf16_on = [] { const char* v = std::getenv("STRATA_WMMA_BF16"); return !v || (v[0] != 0 && v[0] != '0'); }();
-    if (wmma_on && bf16_on && ldx == 0 && T >= 16 && (beta == 0.0f || beta == 1.0f) &&
+    if (wmma_on && bf16_on && ldx == 0 && T >= 1 && (beta == 0.0f || beta == 1.0f) &&
         strata_wmma_gemm_bf16(X, W, Y, T, N, K, ldy, beta, stream_)) {
         return;
     }
@@ -1178,7 +1178,7 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     static const bool pf_on = [] { const char* v = std::getenv("STRATA_PF_GEMM"); return v && v[0] == '1'; }();
     static const int64_t pf_min_t = [] { const char* v = std::getenv("STRATA_PF_SWITCH_MIN_T"); return v ? (int64_t) std::atoll(v) : (int64_t) 0; }();
     if (pf_on && T >= pf_min_t && strata_pf_gemm_f16(X, W, Y, T, N, K, ldy, beta, stream_)) return;   // S23: opt-in
-    if (wmma_on && T >= 16 && (beta == 0.0f || beta == 1.0f) &&
+    if (wmma_on && T >= 1 && (beta == 0.0f || beta == 1.0f) &&
         strata_wmma_gemm_f16(X, W, Y, T, N, K, ldy, beta, stream_)) {
         return;
     }
@@ -1364,6 +1364,46 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     if (pad_on && pf_on && T >= pf_min_t && T >= 64 && N >= 512 && K % 32 == 0 && N * (K + 64) <= scratch_elems_ &&
         strata_pf_padded_gemm_available()) {
         const int64_t ldw = K + 64;
+        if (w16_budget_ < 0) {
+            const char* v = std::getenv("STRATA_PF_W16_CACHE_MIB");
+            if (v != nullptr) {
+                w16_budget_ = (int64_t) std::atoll(v) * (1ll << 20);
+                w16_reserve_ = 8ll << 30;
+            } else {
+                w16_budget_ = 0;
+            }
+        }
+        if (w16_budget_ > 0) {
+            const int64_t bytes = N * ldw * 2;
+            uint16_t* cw = nullptr;
+            for (const W16Entry& e : w16_)
+                if (e.p == W_blocks && e.type == ggml_type && e.n == N && e.k == K) { cw = e.d; break; }
+            if (cw == nullptr && w16_used_ + bytes <= w16_budget_) {
+                size_t fb = 0, tb = 0;
+                if (cudaMemGetInfo(&fb, &tb) == cudaSuccess && fb > (size_t) bytes + (size_t) w16_reserve_ &&
+                    cudaMalloc((void**) &cw, (size_t) bytes) == cudaSuccess) {
+                    if (strata::kernels::dequant_f16_ld(ggml_type, W_blocks, 0, N, K, ldw, cw, stream_)) {
+                        w16_.push_back({W_blocks, ggml_type, N, K, cw});
+                        w16_used_ += bytes;
+                    } else {
+                        (void) cudaFree(cw);
+                        cw = nullptr;
+                    }
+                } else {
+                    (void) cudaGetLastError();
+                    cw = nullptr;
+                    if (w16_budget_ > 0 && !w16_logged_) {
+                        w16_logged_ = true;
+                        std::fprintf(stderr, "strata prefill: FP16 weight cache %lld MiB (kept %lld MiB free)\n",
+                                     (long long) (w16_used_ >> 20), (long long) (w16_reserve_ >> 20));
+                    }
+                    w16_budget_ = w16_used_ > 0 ? w16_used_ : 0;
+                }
+            }
+            if (cw != nullptr && strata_pf_gemm_f16_ld(X, ldx > 0 ? ldx : K, cw, ldw, Y, T, N, K, ldy, beta, stream_)) {
+                return;
+            }
+        }
         if (strata::kernels::dequant_f16_ld(ggml_type, W_blocks, 0, N, K, ldw, scratch_, stream_) &&
             strata_pf_gemm_f16_ld(X, ldx > 0 ? ldx : K, scratch_, ldw, Y, T, N, K, ldy, beta, stream_)) {
             return;

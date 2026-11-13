@@ -41,10 +41,10 @@ __device__ __forceinline__ float warp_max(float v) {
 // LDS-only workgroup barrier: avoids the L0 vector cache invalidation (global_inv scope:SCOPE_SE) and in-flight
 // global-load drain (s_wait_loadcnt 0x0) that __syncthreads() emits on gfx12 when only shared memory is synchronized.
 __device__ __forceinline__ void qda_sync_lds() {
-#if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx1200__) || defined(__gfx1201__))
+#if defined(__HIP_DEVICE_COMPILE__) && (defined(__GFX12__))
     __asm__ volatile("s_wait_dscnt 0x0\n\ts_barrier_signal -1\n\ts_barrier_wait -1" ::: "memory");
 #elif defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx1030__) || defined(__gfx1100__) || defined(__gfx1101__) || \
-    defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__))
+    defined(__GFX11__))
     __asm__ volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
 #else
     __syncthreads();
