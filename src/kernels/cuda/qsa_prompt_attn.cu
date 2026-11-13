@@ -1933,6 +1933,25 @@ struct alignas(16) SmemWT {
 };
 using SmemW = SmemWT<16>;
 
+// ---- Phase F16: the fp16-KV prompt attention on matrix cores (STRATA_HIP_WMMA, gfx11/gfx12).
+// The same grid, online softmax and epilogue as the S6 int8 kernel above, but K/V come straight from the
+// fp16 pools: no codes, no scales, no Hadamard/inverse, no fp16-range renormalization of V.  K reads 2x the
+// bytes of int8 (still far below the roofline: the int8 kernel at the same speed proves compute-bound) and V
+// stages 2x the LDS (16 KB); in return every dequant ALU op is gone and the register file holds the same
+// bytes as the SPLIT-off S6 path.  One variant only (TR = 0 in S6 terms): the S6 trim levels are
+// bit-identical, so there is nothing to tune here.  Numerics vs the FP32 kernel: the same summation order
+// with fp16 K/V used as is (no rounding beyond the fp16 pools themselves).
+struct alignas(16) SmemWF16 {
+    float part[4][16][WCH + 1];   // q.k per dim group
+    float p[16][WCH + 1];         // softmax probabilities
+    int valid[WCH];               // the cell has a resident pool row
+    _Float16 v[4][WCH][64];       // staged V slice: per wave, per cell, 64 dims
+    float qmax[4];
+    float alpha[16];
+    float lsum[16];
+    float mrow[16];
+};
+
 __device__ __forceinline__ wf8 wmma_f16(wh8 a, wh8 b, wf8 c) {
 #if STRATA_PA_WMMA && STRATA_PA_GFX11
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
@@ -2229,6 +2248,256 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
                                                                    const float* __restrict__ qf = nullptr,
                                                                    uint16_t* __restrict__ o16 = nullptr, int64_t ld16 = 0) {
     prompt_attn_wmma_body<SPLIT, GATE, RPF, TR>(q, p, ids, steps, n_kv_heads, page_size, scale_log2, attn, cap, qf, o16, ld16);
+}
+
+// ---- Phase F16: the fp16-KV WMMA body (see SmemWF16 above for the contract).
+template <bool SPLIT, bool GATE, bool RPF>
+__device__ __forceinline__ void prompt_attn_wmma_f16_body(const float* __restrict__ q, QsaAttnPools p,
+                                                          const int32_t* __restrict__ ids,
+                                                          const int32_t* __restrict__ steps, int n_kv_heads,
+                                                          int page_size, float scale_log2,
+                                                          float* __restrict__ attn, int cap,
+                                                          const float* __restrict__ qf,
+                                                          uint16_t* __restrict__ o16, int64_t ld16) {
+#if STRATA_PA_WMMA
+    __shared__ SmemWF16 S;
+    const int qi = blockIdx.x, kvh = blockIdx.y;
+    const int n_head = n_kv_heads * G;
+    q += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
+    attn += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
+    ids += (size_t) qi * cap;
+    const int n = __ldg(steps + (size_t) qi * kStepCount + kStepWidth);
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int col = lane & 15, half = lane >> 4;   // fragment column / k half
+    const int dim0 = warp * 64;
+
+    float qm = 0.0f;
+    for (int i = t; i < G * HD; i += THREADS) qm = fmaxf(qm, fabsf(q[i]));
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) qm = fmaxf(qm, __shfl_xor_sync(0xffffffffu, qm, o));
+    if (lane == 0) S.qmax[warp] = qm;
+    if (t < 16) { S.mrow[t] = -INFINITY; S.lsum[t] = 0.0f; }
+    __syncthreads();
+    qm = fmaxf(fmaxf(S.qmax[0], S.qmax[1]), fmaxf(S.qmax[2], S.qmax[3]));
+    int qe = 0;
+    if (qm > 0.0f) frexpf(qm, &qe);
+    const float qup = ldexpf(1.0f, 14 - qe), qdown = ldexpf(scale_log2, qe - 14);
+    // q A fragments of this wave's 64 dims: row = col (heads 12..15 zero), k = dim0 + kk*16 + PA_KOFF(half) + i
+    wh8 qh[4], ql[4];
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) {
+        float x[PA_KL];
+        if (col < G) {
+            const float4* src = reinterpret_cast<const float4*>(q + (size_t) col * HD + dim0 + kk * 16 + PA_KOFF(half));
+#pragma unroll
+            for (int j = 0; j < PA_KL / 4; ++j) {
+                const float4 a = src[j];
+                x[4 * j] = a.x; x[4 * j + 1] = a.y; x[4 * j + 2] = a.z; x[4 * j + 3] = a.w;
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < PA_KL; ++i) x[i] = 0.0f;
+        }
+#pragma unroll
+        for (int i = 0; i < PA_KL; ++i) {
+            const float v = x[i] * qup;
+            const _Float16 hi = (_Float16) v;
+            qh[kk][i] = hi;
+            ql[kk][i] = (_Float16) (v - (float) hi);
+        }
+    }
+
+    wf8 acc[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) acc[j] = wf8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    const int n_chunks = (n + WCH - 1) / WCH;
+    // chunk ci's cell for this lane (lane = cell index): its pool row, or -1 (past the selection, or a block the KV
+    // streaming left non-resident: masked as in the decode kernel)
+    auto row_of = [&](int ci) -> long long {
+        const int c0 = ci * WCH;
+        long long r = -1;
+        if (c0 + lane < n) {
+            const int cell = __ldg(ids + c0 + lane);
+            const long long page = (long long) __ldg(p.page_table + cell / page_size);
+            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+        }
+        return r;
+    };
+    // a chunk's global reads: this wave's V slice (64 fp16 of the row) and the K fragments (16 fp16
+    // per lane) of its two 16-cell tiles
+    struct Chunk {
+        long long row;
+        uint4 v[8];
+        wh8 kx[2][4];
+    };
+    auto fetch = [&](long long row, Chunk& d) {
+        d.row = row;
+        d.v[0] = d.v[1] = d.v[2] = d.v[3] = d.v[4] = d.v[5] = d.v[6] = d.v[7] = make_uint4(0, 0, 0, 0);
+        if (row >= 0) {
+            const uint4* src = reinterpret_cast<const uint4*>(p.v_pool + row * HD + dim0);
+            d.v[0] = __ldg(src); d.v[1] = __ldg(src + 1); d.v[2] = __ldg(src + 2); d.v[3] = __ldg(src + 3);
+            d.v[4] = __ldg(src + 4); d.v[5] = __ldg(src + 5); d.v[6] = __ldg(src + 6); d.v[7] = __ldg(src + 7);
+        }
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            const long long rr = __shfl(row, nt * 16 + col);
+#pragma unroll
+            for (int kk = 0; kk < 4; ++kk) {
+#pragma unroll
+                for (int i = 0; i < PA_KL; ++i) d.kx[nt][kk][i] = (_Float16) 0.0f;
+                if (rr >= 0) {
+                    const uint16_t* kp = reinterpret_cast<const uint16_t*>(p.k_pool) +
+                                         (size_t) rr * HD + dim0 + kk * 16 + PA_KOFF(half);
+#pragma unroll
+                    for (int i = 0; i < PA_KL; ++i)
+                        d.kx[nt][kk][i] = (_Float16) __half2float(__ushort_as_half(__ldg(kp + i)));
+                }
+            }
+        }
+        if (warp == 0) S.valid[lane] = row >= 0;
+    };
+    auto chunk = [&](const Chunk& cd) {
+        // stage this wave's V slice
+        {
+            uint4* dst = reinterpret_cast<uint4*>(&S.v[warp][lane][0]);
+            dst[0] = cd.v[0]; dst[1] = cd.v[1]; dst[2] = cd.v[2]; dst[3] = cd.v[3];
+            dst[4] = cd.v[4]; dst[5] = cd.v[5]; dst[6] = cd.v[6]; dst[7] = cd.v[7];
+        }
+        // q.k over this wave's 64 dims for two 16-cell tiles (fp16 K used as is: no scales)
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            wf8 s = wf8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for (int kk = 0; kk < 4; ++kk) {
+                const wh8 b = cd.kx[nt][kk];
+                s = wmma_f16(qh[kk], b, s);
+                if constexpr (SPLIT) s = wmma_f16(ql[kk], b, s);
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) S.part[warp][PA_ROW(i, half)][nt * 16 + col] = s[i];
+        }
+        __syncthreads();
+        // online softmax over the four groups' sum (fixed order): row t/8, 4 cells per thread
+        {
+            const int r = t >> 3, sub = t & 7;
+            float x[4], mx = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int c = sub * 4 + j;
+                // past the selection, or a masked cell (non-resident page, as in the decode kernel): no weight
+                x[j] = S.valid[c] ? (((S.part[0][r][c] + S.part[1][r][c]) + S.part[2][r][c]) + S.part[3][r][c]) * qdown
+                                  : -INFINITY;
+                mx = fmaxf(mx, x[j]);
+            }
+#pragma unroll
+            for (int o = 1; o < 8; o <<= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            const float m_old = S.mrow[r];
+            const float m_new = fmaxf(m_old, mx);
+            float sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float e = x[j] == -INFINITY ? 0.0f : exp2f(x[j] - m_new);
+                S.p[r][sub * 4 + j] = e;
+                sum += e;
+            }
+#pragma unroll
+            for (int o = 1; o < 8; o <<= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            if (sub == 0) {
+                const float a = m_old == -INFINITY ? 0.0f : exp2f(m_old - m_new);
+                S.alpha[r] = a;
+                S.lsum[r] = fmaf(S.lsum[r], a, sum);
+                S.mrow[r] = m_new;
+            }
+        }
+        __syncthreads();
+        // p.v over this wave's 64 dims: 4 tiles of 16 dims, 2 k-steps of 16 cells (fp16 V used as is)
+        wf8 tmp[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) tmp[j] = wf8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int ks = 0; ks < 2; ++ks) {
+            const int cb = ks * 16 + PA_KOFF(half);   // this lane's PA_KL cells
+            wh8 ah, al;
+#pragma unroll
+            for (int i = 0; i < PA_KL; ++i) {
+                const float pv = S.p[col][cb + i];
+                const _Float16 hi = (_Float16) pv;
+                ah[i] = hi;
+                al[i] = (_Float16) (pv - (float) hi);
+            }
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int d = j * 16 + col;
+                wh8 b;
+#pragma unroll
+                for (int i = 0; i < PA_KL; ++i) b[i] = S.v[warp][cb + i][d];
+                tmp[j] = wmma_f16(ah, b, tmp[j]);
+                if constexpr (SPLIT) tmp[j] = wmma_f16(al, b, tmp[j]);
+            }
+        }
+        float a[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) a[i] = S.alpha[PA_ROW(i, half)];
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) acc[j][i] = fmaf(acc[j][i], a[i], tmp[j][i]);
+        // no barrier here: the staged V is this wave's own, and `p`/`alpha`/`valid` are rewritten only after the next
+        // chunk's first barrier (which every wave reaches after its p.v)
+    };
+    // all of a chunk's reads are issued before its compute (they were interleaved with the q.k WMMAs and the V
+    // staging)
+    if constexpr (RPF) {
+        long long nrow = n_chunks > 0 ? row_of(0) : -1;
+        for (int ci = 0; ci < n_chunks; ++ci) {
+            Chunk d;
+            fetch(nrow, d);
+            if (ci + 1 < n_chunks) nrow = row_of(ci + 1);
+            chunk(d);
+        }
+    } else {
+        for (int ci = 0; ci < n_chunks; ++ci) {
+            Chunk d;
+            fetch(row_of(ci), d);
+            chunk(d);
+        }
+    }
+    float inv[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const float l = S.lsum[PA_ROW(i, half)];
+        inv[i] = l > 0.0f ? 1.0f / l : 0.0f;
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int row = PA_ROW(i, half);
+            if (row < G) {
+                if constexpr (GATE) {
+                    const int h = kvh * G + row, d = dim0 + j * 16 + col;
+                    const float a = acc[j][i] * inv[i];
+                    o16[(size_t) qi * ld16 + (size_t) h * HD + d] =
+                        __half_as_ushort(__float2half_rn(a * (1.0f / (1.0f + expf(-qf[(size_t) qi * n_head * 2 * HD + (size_t) h * 2 * HD + HD + d])))));
+                } else {
+                    attn[(size_t) row * HD + dim0 + j * 16 + col] = acc[j][i] * inv[i];
+                }
+            }
+        }
+#else
+    __builtin_trap();
+#endif
+}
+template <bool SPLIT, bool GATE, bool RPF>
+__global__ void __launch_bounds__(THREADS) prompt_attn_wmma_f16_kernel(const float* __restrict__ q, QsaAttnPools p,
+                                                                      const int32_t* __restrict__ ids,
+                                                                      const int32_t* __restrict__ steps, int n_kv_heads,
+                                                                      int page_size, float scale_log2,
+                                                                      float* __restrict__ attn, int cap,
+                                                                      const float* __restrict__ qf = nullptr,
+                                                                      uint16_t* __restrict__ o16 = nullptr, int64_t ld16 = 0) {
+    prompt_attn_wmma_f16_body<SPLIT, GATE, RPF>(q, p, ids, steps, n_kv_heads, page_size, scale_log2, attn, cap, qf, o16, ld16);
 }
 
 // ===================== Phase B: q4_sym S6 matrix-core prompt attention =====================
@@ -2815,6 +3084,56 @@ bool launch_wmma(const float* q, const QsaAttnPools& pools, const int32_t* ids, 
     }
     return true;
 }
+
+// ---- Phase F16: the fp16-KV launchers (one variant: TR = 0 in S6 terms).
+// STRATA_PROMPT_ATTN_F16=0 opts fp16 KV back out to the FP32 scalar fallback.
+bool pa_f16_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_PROMPT_ATTN_F16"); return !(e && e[0] == '0'); }();
+    return on;
+}
+template <bool SPLIT, bool GATE>
+void pa_launch_f16(dim3 grid, cudaStream_t st, const float* q, const QsaAttnPools& pools, const int32_t* ids,
+                   const int32_t* steps, int n_kv_heads, int page_size, float scale_log2, float* attn, int cap,
+                   const float* qf, uint16_t* o16, int64_t ld16) {
+    static const bool rpf = [] { const char* e = std::getenv("STRATA_PA_RPF"); return !(e != nullptr && e[0] == '0'); }();
+#define STRATA_PA_F16L(R) prompt_attn_wmma_f16_kernel<SPLIT, GATE, R><<<grid, THREADS, 0, st>>>(q, pools, ids, steps, n_kv_heads, page_size, scale_log2, attn, cap, qf, o16, ld16)
+    if (rpf) STRATA_PA_F16L(true);
+    else STRATA_PA_F16L(false);
+#undef STRATA_PA_F16L
+}
+
+bool launch_wmma_f16(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
+                     const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st, const float* gate_qf = nullptr,
+                     uint16_t* gate_o16 = nullptr, int64_t gate_ld = 0) {
+    const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
+    for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
+        const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
+        static const bool fast = [] { const char* e = std::getenv("STRATA_PA_FAST"); return e != nullptr && e[0] == '1'; }();
+        static const int64_t min_t = [] { const char* e = std::getenv("STRATA_PF_SWITCH_MIN_T"); return e ? (int64_t) std::atoll(e) : (int64_t) 0; }();
+        const dim3 grid((unsigned) nb, (unsigned) s.n_head_kv);
+        const float* qq = q + q0 * s.n_head * HD;
+        const int32_t* idq = ids + q0 * cap;
+        const int32_t* stq = steps + q0 * kStepCount;
+        if (gate_qf != nullptr) {   // STRATA_QSA_FUSE_GATE: the gated FP16 image straight from the epilogue
+            const float* qfq = gate_qf + (size_t) q0 * s.n_head * 2 * HD;
+            uint16_t* o16q = gate_o16 + (size_t) q0 * gate_ld;
+            if (fast && n_q >= min_t)
+                pa_launch_f16<false, true>(grid, st, qq, pools, idq, stq, (int) s.n_head_kv, (int) s.page_size, scale_log2, nullptr, (int) cap, qfq, o16q, gate_ld);
+            else
+                pa_launch_f16<true, true>(grid, st, qq, pools, idq, stq, (int) s.n_head_kv, (int) s.page_size, scale_log2, nullptr, (int) cap, qfq, o16q, gate_ld);
+        } else if (fast && n_q >= min_t)
+            pa_launch_f16<false, false>(grid, st, qq, pools, idq, stq, (int) s.n_head_kv, (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap, nullptr, nullptr, 0);
+        else
+            pa_launch_f16<true, false>(grid, st, qq, pools, idq, stq, (int) s.n_head_kv, (int) s.page_size, scale_log2, attn + q0 * s.n_head * HD, (int) cap, nullptr, nullptr, 0);
+    }
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "qsa_prompt_attn_batch (wmma f16): %s; the FP32 prompt attention runs from here on\n", cudaGetErrorString(e));
+        g_wmma_failed.store(true);
+        return false;
+    }
+    return true;
+}
 #endif
 
 
@@ -2975,6 +3294,10 @@ bool qsa_prompt_attn_batch_gated(const float* q, const QsaAttnPools& pools, cons
         pools.k_q4 == nullptr && pools.v_q4 == nullptr && s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv &&
         cap > 0 && ids && steps && pools.page_table && hip_wmma_usable(n_q, cap))
         return launch_wmma(q, pools, ids, steps, cap, s, nullptr, n_q, (cudaStream_t) stream, qf, o16, ld16);
+    if (pa_f16_on() && pools.k_pool != nullptr && pools.v_pool != nullptr && pools.k_q == nullptr &&
+        pools.k_q4 == nullptr && s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv &&
+        cap > 0 && ids && steps && pools.page_table && hip_wmma_usable(n_q, cap))
+        return launch_wmma_f16(q, pools, ids, steps, cap, s, nullptr, n_q, (cudaStream_t) stream, qf, o16, ld16);
 #else
     (void) q; (void) pools; (void) ids; (void) steps; (void) cap; (void) s; (void) qf; (void) o16; (void) ld16; (void) n_q; (void) stream;
 #endif
@@ -3027,6 +3350,10 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         pools.k_q4 == nullptr && pools.v_q4 == nullptr && s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv &&
         cap > 0 && ids && steps && pools.page_table && hip_wmma_usable(n_q, cap))
         return launch_wmma(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream);
+    if (pa_f16_on() && pools.k_pool != nullptr && pools.v_pool != nullptr && pools.k_q == nullptr &&
+        pools.k_q4 == nullptr && s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv &&
+        cap > 0 && ids && steps && pools.page_table && hip_wmma_usable(n_q, cap))
+        return launch_wmma_f16(q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream);
     return false;
 #endif
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids || !steps || !pools.page_table)

@@ -411,9 +411,7 @@ int main(int argc, char** argv) {
     const int reps = argc > 3 ? std::atoi(argv[3]) : 5;
     int fails = 0;
     fails += run(1, ctx, nq, reps);
-#if !defined(__HIP_PLATFORM_AMD__)
-    fails += run(0, ctx, nq, reps);   // FP16 KV: the RDNA4 kernel takes int8 KV only
-#endif
+    fails += run(0, ctx, nq, reps);   // FP16 KV: the matrix-core f16 kernel (HIP) or the tensor kernel (CUDA)
     fails += run(2, ctx, nq, reps);   // Q4_0 KV (mode 4)
     fails += run(2, 1500, std::min<int64_t>(nq, 1500), reps);
     fails += run(1, 1500, std::min<int64_t>(nq, 1500), reps);   // short context: the selection is every cell

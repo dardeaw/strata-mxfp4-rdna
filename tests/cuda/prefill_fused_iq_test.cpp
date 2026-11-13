@@ -61,6 +61,8 @@ struct Pair {
 };
 // MMQ covers this pair (the HIP build has no Q4_K / Q5_K / Q5_1 MMQ: those pairs are checked against the reference only)
 bool mmq_ok(const Pair& p) { return mmq::supported((int) p.gu) && mmq::supported((int) p.d); }
+// MXFP4 has no MMQ entry (the engine's known-bad FP8 fold aside): fused vs ggml's own dequant reference only.
+bool mxfp4_pair(const Pair& p) { return p.gu == GGML_TYPE_MXFP4 || p.d == GGML_TYPE_MXFP4; }
 
 struct Geo {
     size_t gu_row, d_row, up_off, down_off, bytes;
@@ -95,9 +97,30 @@ void fill_matrix(uint8_t* m, ggml_type t, int64_t rows, int64_t cols, std::mt199
     std::uniform_int_distribution<int> byte(0, 255);
     const float lo = t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K ? 0.00004f : t == GGML_TYPE_Q5_1 ? 0.0006f
                    : t == GGML_TYPE_Q8_0 ? 0.0001f : t == GGML_TYPE_IQ3_S ? 0.0004f : t == GGML_TYPE_IQ4_XS ? 0.00005f
-                   : t == GGML_TYPE_IQ4_NL ? 0.0002f : t == GGML_TYPE_Q2_0 ? 0.004f : 0.0008f;
+                   : t == GGML_TYPE_IQ4_NL ? 0.0002f : t == GGML_TYPE_Q2_0 ? 0.004f : t == GGML_TYPE_MXFP4 ? 0.0016f : 0.0008f;
     std::uniform_real_distribution<float> sc(lo, 6.0f * lo);
     for (size_t i = 0; i < nb * bs; ++i) m[i] = (uint8_t) byte(rng);
+    if (t == GGML_TYPE_MXFP4) {   // an MXFP4 block is 17 bytes: the E8M0 scale byte then 16 code bytes. The scale
+                                  // goes to the power of two nearest sc (the real packs' distribution), and the
+                                  // nibble pairs get random signs (half-negative weights, as in a trained expert).
+        static const int8_t kx2[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+        std::uniform_real_distribution<float> su(0.0f, 1.0f);
+        for (size_t b = 0; b < nb; ++b) {
+            const float w = sc(rng);
+            int e = w > 0.0f ? (int) std::lround(std::log2(w)) + 127 : 127;
+            e = std::min(254, std::max(1, e));
+            m[b * bs] = (uint8_t) e;
+            const float s = std::ldexp(1.0f, e - 127);
+            for (int i = 0; i < 16; ++i) {
+                const int lo_n = rng() & 7, hi_n = rng() & 7;
+                const float vlo = s * (float) kx2[lo_n] / 2.0f, vhi = s * (float) kx2[hi_n] / 2.0f;
+                const int lsb = (rng() & 1) && !(lo_n == 0 || lo_n == 8) ? 8 : 0;   // (the zero codes keep their byte)
+                const int msb = (rng() & 1) && !(hi_n == 0 || hi_n == 8) ? 8 : 0;
+                m[b * bs + 1 + i] = (uint8_t) ((lo_n | lsb) | ((hi_n | msb) << 4));
+            }
+        }
+        return;
+    }
     for (size_t b = 0; b < nb; ++b) {
         const ggml_fp16_t h = ggml_fp32_to_fp16(sc(rng));
         std::memcpy(m + b * bs, &h, 2);
@@ -298,6 +321,16 @@ void quant32(const float* in, float* out, int n) {
         for (int j = 0; j < 32; ++j) out[b + j] = (float) std::nearbyint(in[b + j] * inv) * d;
     }
 }
+// the MXFP4 fused kernels' activation rounding: __float2int_rn = round to nearest even (the F16 path's model in
+// reference_part); quant32 above keeps nearbyint's current mode for the i-quant paths' existing checks
+void quant32rn(const float* in, float* out, int n) {
+    for (int b = 0; b < n; b += 32) {
+        float am = 0.0f;
+        for (int j = 0; j < 32; ++j) am = std::max(am, std::fabs(in[b + j]));
+        const float inv = am > 0.0f ? 127.0f / am : 0.0f, d = am / 127.0f;
+        for (int j = 0; j < 32; ++j) out[b + j] = (float) std::rint(in[b + j] * inv) * d;
+    }
+}
 
 std::vector<float> download(const Dev& d, size_t n) {
     std::vector<float> h(n);
@@ -405,6 +438,69 @@ void reference_part(const Pair& p, cudaStream_t s) {
     const Err em = mq ? compare(y_mmq, mrow, ref, pair, (size_t) rows) : Err{};
     const Err ef = compare(y_f, frow, ref, pair, (size_t) rows);
     const Err efm = mq ? compare(y_f, frow, y_mmq, mrow, (size_t) rows) : Err{};
+    if (mxfp4_pair(p)) {   // the fused MXFP4 kernels keep the GGUF's exact codes and E8M0 scale in their dot; only
+                           // the activations go through int8 per-32 rounding, so the right model is ggml's dequant
+                           // weights x the round-TO-nearest activation (rt), not ref2's round-away-from-zero.
+        std::vector<float> rt(x.size());
+        for (size_t i = 0; i < x.size(); ++i) {
+            const int b = (int) (i % 32);
+            float am = 0.0f;
+            for (int j = 0; j < 32; ++j) am = std::max(am, std::fabs(x[i - b + j]));
+            rt[i] = am > 0.0f ? (float) std::rint(x[i] * (127.0 / am)) * (am / 127.0f) : 0.0f;
+        }
+        const Err er = compare(y_f, frow, ref2, pair, (size_t) rows);       // round-away model (the i-quant kernels')
+        std::printf("  fused vs exact-weights/quant-act model: rel RMS %.3e  worst %.3e\n", er.rms, er.worst);
+        if (er.rms > 5e-3 || er.worst > 3e-2) {
+            // the MXFP4 kernels round activations to nearest; ref2 above rounds away from zero. Recheck against a
+            // round-to-nearest activation model before failing.
+            double e2 = 0, r2 = 0, worst = 0;
+            const int nthr = std::max(1, std::min(16, (int) std::thread::hardware_concurrency()));
+            std::vector<std::thread> th2;
+            std::vector<double> pe(nthr, 0), pr(nthr, 0), pw(nthr, 0);
+            for (int w = 0; w < nthr; ++w)
+                th2.emplace_back([&, w] {
+                    std::vector<float> gu, dn, h(FF);
+                    for (int e = w; e < E; e += nthr) {
+                        if (r.cnt[(size_t) e] == 0) continue;
+                        dequant(p, geo, host[(size_t) e], gu, dn);
+                        for (int64_t i = 0; i < rows; ++i) {
+                            if (ids[(size_t) i] != e) continue;
+                            const float* xr = rt.data() + (size_t) (i / K) * N;
+                            for (int f = 0; f < FF; ++f) {
+                                double gt = 0, up = 0;
+                                const float *wg = gu.data() + (size_t) f * N, *wu = gu.data() + (size_t) (FF + f) * N;
+                                for (int k = 0; k < N; ++k) { gt += (double) wg[k] * xr[k]; up += (double) wu[k] * xr[k]; }
+                                h[(size_t) f] = (float) (gt / (1.0 + std::exp(-gt)) * up);
+                            }
+                            double me = 0, mr = 0;
+                            for (int o = 0; o < N; ++o) {
+                                double a = 0;
+                                const float* wd = dn.data() + (size_t) o * FF;
+                                for (int f = 0; f < FF; ++f) a += (double) wd[f] * h[(size_t) f];
+                                const float y = y_f[(size_t) slot[i] * N + o];
+                                const double d = (double) y - a;
+                                pe[w] += d * d; pr[w] += a * a;
+                                me = std::max(me, std::fabs(d)); mr = std::max(mr, std::fabs(a));
+                            }
+                            if (mr > 0) pw[w] = std::max(pw[w], me / mr);
+                        }
+                    }
+                });
+            for (auto& t : th2) t.join();
+            for (int w = 0; w < nthr; ++w) { e2 += pe[w]; r2 += pr[w]; worst = std::max(worst, pw[w]); }
+            const double rms = r2 > 0 ? std::sqrt(e2 / r2) : 0.0;
+            std::printf("  fused vs exact-weights/round-nearest model: rel RMS %.3e  worst %.3e\n", rms, worst);
+            if (rms > 5e-3 || worst > 3e-2)
+                throw std::runtime_error(std::string(p.name) + ": the fused MXFP4 path differs from its own arithmetic");
+        }
+        std::printf("  fused vs FP32 reference: rel RMS %.3e  worst row max rel %.3e\n", ef.rms, ef.worst);
+        double zmax0 = 0;
+        for (int k = 0; k < K; ++k)
+            for (int o = 0; o < N; ++o)
+                zmax0 = std::max(zmax0, (double) std::fabs(y_f[(size_t) slot[(size_t) (ZERO * K + k)] * N + o]));
+        if (zmax0 != 0) throw std::runtime_error(std::string(p.name) + ": the all-zero token's outputs are not zero");
+        return;
+    }
     const Err e2 = compare(y_f, frow, ref2, pair, (size_t) rows);
     std::printf("  fused vs the int8-rounded model (same activation / H rounding, double sums): rel RMS %.3e  worst %.3e\n",
                 e2.rms, e2.worst);
@@ -537,9 +633,13 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
     }
     const Err efm = mq ? compare(y_f, [&](size_t i) { return (int64_t) slot[i]; }, y_mmq,
                                  [&](size_t i) { return (int64_t) r.row_of[i]; }, (size_t) rows) : Err{};
-    std::printf("%s - timing part: %d tokens x top %d over %d experts, one layer: MMQ path %.3f ms, fused %.3f ms "
-                "(%.2fx); fused vs MMQ rel RMS %.3e worst row %.3e\n",
-                p.name, T, K, E, t_mmq, t_f, t_mmq / t_f, efm.rms, efm.worst);
+    if (!no_mmq)
+        std::printf("%s - timing part: %d tokens x top %d over %d experts, one layer: MMQ path %.3f ms, fused %.3f ms "
+                    "(%.2fx); fused vs MMQ rel RMS %.3e worst row %.3e\n",
+                    p.name, T, K, E, t_mmq, t_f, t_mmq / t_f, efm.rms, efm.worst);
+    else
+        std::printf("%s - timing part: %d tokens x top %d over %d experts, one layer: fused %.3f ms (no MMQ here)\n",
+                    p.name, T, K, E, t_f);
     {   // the grouping: every pair in its expert's rows (the near-identical blobs here would hide a wrong expert)
         const std::vector<int32_t> fsrc = download_i(fb.src, (size_t) rows);
         int64_t bad = 0, bad_src = 0;
@@ -614,11 +714,23 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
             ck(cudaMemcpy(hb.data(), blob[(size_t) e], geo.bytes, cudaMemcpyDeviceToHost), "blob back");
             dequant(p, geo, hb, gu, dn);
             const float* xr = x.data() + (i / K) * N;
+            std::vector<float> xrq((size_t) N);   // fresh buffer: quant32rn reads in-block maxes as it writes
+            if (mxfp4_pair(p)) {
+                quant32rn(xr, xrq.data(), N);   // the MXFP4 kernels round activations to nearest
+            } else {
+                std::copy_n(xr, N, xrq.data());
+                for (int f = 0; f < FF; ++f) h[f] = 0.0f;   // the i-quant path's H model rounds H itself below
+            }
             for (int f = 0; f < FF; ++f) {
                 double gt = 0, up = 0;
                 const float *wg = gu.data() + (size_t) f * N, *wu = gu.data() + (size_t) (FF + f) * N;
-                for (int k = 0; k < N; ++k) { gt += (double) wg[k] * xr[k]; up += (double) wu[k] * xr[k]; }
+                for (int k = 0; k < N; ++k) { gt += (double) wg[k] * xrq[k]; up += (double) wu[k] * xrq[k]; }
                 h[(size_t) f] = (float) (gt / (1.0 + std::exp(-gt)) * up);
+            }
+            if (!mxfp4_pair(p)) {   // the timing harness's i-quant model: H goes through q8_1 (quant32) into the down GEMM
+                std::vector<float> hq((size_t) FF);
+                quant32(h.data(), hq.data(), FF);
+                h.swap(hq);
             }
             for (int o = 0; o < N; ++o) {
                 double a = 0;
@@ -633,7 +745,13 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
         const Err em = mq ? compare(ym, id, ref, id, pick.size()) : Err{}, ef = compare(yf, id, ref, id, pick.size());
         std::printf("  sample of %zu pairs vs FP32 reference: MMQ rel RMS %.3e worst %.3e, fused rel RMS %.3e worst "
                     "%.3e\n", pick.size(), em.rms, em.worst, ef.rms, ef.worst);
-        if (!mq ? (ef.rms > 0.03 || ef.worst > 0.25) : (ef.rms > 1.5 * em.rms || ef.worst > 2.0 * em.worst))
+        if (mxfp4_pair(p)) {   // the ref above used the kernels' round-to-nearest activations: the sample sits at the
+                               // FP16 products' rounding only (reference_part's model, not the raw FP32 x)
+            std::printf("  sample of %zu pairs vs exact-weights/round-nearest model: rel RMS %.3e worst %.3e\n",
+                        pick.size(), ef.rms, ef.worst);
+            if (ef.rms > 5e-3 || ef.worst > 3e-2)
+                throw std::runtime_error(std::string(p.name) + ": the fused MXFP4 path differs from its own arithmetic (timing)");
+        } else if (!mq ? (ef.rms > 0.03 || ef.worst > 0.25) : (ef.rms > 1.5 * em.rms || ef.worst > 2.0 * em.worst))
             throw std::runtime_error(std::string(p.name) + ": the fused path's error is not comparable to MMQ's (timing)");
     }
     cudaEventDestroy(a);
@@ -696,7 +814,9 @@ int main(int argc, char** argv) {
             {GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL, "IQ2_S / IQ4_NL"},   {GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_0, "IQ3_XXS / Q2_0"},
             {GGML_TYPE_IQ3_S, GGML_TYPE_Q2_0, "IQ3_S / Q2_0"},       {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, "IQ4_XS / IQ4_NL"},
             // the canonical Q2_0 pack (gate/up and down Q2_0; CUDA)
-            {GGML_TYPE_Q2_0, GGML_TYPE_Q2_0, "Q2_0 / Q2_0"}};
+            {GGML_TYPE_Q2_0, GGML_TYPE_Q2_0, "Q2_0 / Q2_0"},
+            // the jamesrogers MXFP4 pack (HIP: gfx12 native_w11 int8-dot / gfx11 native_f16; --only=MXFP4)
+            {GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, "MXFP4 / MXFP4"}};
         const char* only = nullptr;   // --only=NAME: the pairs whose name contains NAME
         for (int i = 1; i < argc; ++i)
             if (std::strncmp(argv[i], "--only=", 7) == 0) only = argv[i] + 7;
