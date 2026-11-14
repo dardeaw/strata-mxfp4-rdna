@@ -243,24 +243,29 @@ Decode medians (`--spec 4 --short-read 64 --mtp-q4 head`): `short 37.50`, `prose
 
 ### RDNA3 Discrete GPU Results (AMD Radeon RX 7800 XT, `gfx1101`, 16 GB, ROCm 7.2.4)
 
-With `configs/mxfp4-rdna-7800xt.json` (`user_args: ["--kv-resident", "20480"]`, `--spec 4`, `--kv q4_0`):
+Measured under standard server timing protocol (`bench_protocol.py`, `timings.prompt_per_second` & `predicted_per_second`) with `configs/mxfp4-rdna-7800xt.json` (`user_args: ["--kv-resident", "20480"]`, `--spec 4`, `--kv q4_0`):
 
-| Prompt Size | Tokens | Prefill (`tok/s`) | Wall Time |
+| Prompt Size | Actual Tokens | Prefill (`tok/s`) | Wall Time |
 |---:|---:|---:|---:|
-| 2K | 1,759 | **351.2** (cold) | 5.0 s |
-| 4K | 4,251 | **1,095.3** | 3.9 s |
-| 8K | 8,062 | **1,497.2** | 5.4 s |
-| 16K | 16,610 | **1,415.1** | 11.7 s |
-| 32K | 31,855 | **1,669.3** | 19.1 s |
-| 65K | 65,552 | **1,794.9** | 36.5 s |
-| 131K | 132,893 | **1,668.4** | 79.7 s |
-| 250K | 253,411 | **1,759.8** | 144.0 s |
+| 2K | ~2,054 | **622.5 ~ 625.5** | 3.3 s |
+| 4K | ~4,064 | **1,250.8 ~ 1,255.5** | 3.3 s |
+| 8K | ~8,251 | **1,763.6 ~ 1,770.7** | 4.7 s |
+| 16K | ~16,339 | **1,327.8 ~ 1,615.2** | 10.2 ~ 12.3 s |
+| 32K | ~32,635 | **1,868.3 ~ 1,871.0** | 17.5 s |
+| 65K | ~65,377 | **1,960.1 ~ 1,966.8** | 33.3 s |
+| 131K | ~130,676 | **1,836.6 ~ 1,887.2** | 69.3 ~ 71.2 s |
+| 250K | ~248,716 | **1,797.5 ~ 1,809.6** | 137.5 ~ 138.5 s |
 
-- **Decode Throughput**: prose **34.7–37.4**, fib **45.1–52.5**, code **43.2–55.3**, json **26.8–46.4 tok/s**.
-- **MTP Acceptance**: fib **92.2%** (153/166), code **81.1%** (90/111), json **88.6%** (39/44).
+- **Decode Throughput & MTP Acceptance (Engine Timings)**:
+  - `code`: **55.6 ~ 56.9 tok/s** (MTP accept: 81.8% ~ 85.0%)
+  - `fib`: **50.8 ~ 51.1 tok/s** (MTP accept: 87.9% ~ 88.4%)
+  - `json`: **45.3 ~ 46.5 tok/s** (MTP accept: 86.7%)
+  - `repeat`: **43.6 ~ 43.8 tok/s** (MTP accept: 70.0%)
+  - `prose`: **36.8 ~ 38.2 tok/s** (MTP accept: 51.6% ~ 56.0%)
+- **Agent Tool Calling (8/8 PASS)**:
+  - Tasks 1..8 decode throughput: **46.3 ~ 62.7 tok/s** (median **54.4 tok/s**).
 - **Needle in a Haystack**: 2K, 8K, 32K at 10%, 50%, 90% depths — **9 of 9 FOUND (100%)**.
-- **Tools Ladder (MBufo style, 0..128K context)**: **24/24 PASS (100%)**.
-- **ReAct 8-Task Benchmark**: **8/8 PASS (100%)**, median decode **14.2 tok/s**.
+- **Tools Ladder (MBufo style, 0..128K context)**: **24 of 24 PASS (100%)**.
 
 
 ## Agent & Tool Benchmarking: Twin Suites ("雙壁")

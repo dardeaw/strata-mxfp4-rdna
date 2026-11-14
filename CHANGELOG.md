@@ -27,10 +27,11 @@ Version 0.1.60.
   - **RX 7800 XT Verified**: **8/8 PASS (100%)**, median decode **14.2 tok/s**.
 
 ### Comprehensive RX 7800 XT (GFX1101, 16 GB, ROCm 7.2.4) Benchmarks
-- **Prefill Ladder**: 2K **351.2** (cold) | 4K **1,095.3** | 8K **1,497.2** | 16K **1,415.1** | 32K **1,669.3** | 65K **1,794.9** | 131K **1,668.4** | 250K **1,759.8 tok/s**.
+- **Prefill Ladder (Server Protocol Timings)**: 2K **622.5~625.5** | 4K **1,250.8~1,255.5** | 8K **1,763.6~1,770.7** | 16K **1,327.8~1,615.2** | 32K **1,868.3~1,871.0** | 65K **1,960.1~1,966.8** | 131K **1,836.6~1,887.2** | 250K **1,797.5~1,809.6 tok/s**.
 - **Needle in a Haystack**: 2K, 8K, 32K at 10%, 50%, 90% depths — **9 of 9 FOUND (100%)**.
-- **Decode**: prose **34.7–37.4**, fib **45.1–52.5**, code **43.2–55.3**, json **26.8–46.4 tok/s**.
-- **MTP Acceptance**: fib **92.2%** (153/166), code **81.1%** (90/111), json **88.6%** (39/44).
+- **Decode (Engine Timings)**: code **55.6~56.9**, fib **50.8~51.1**, json **45.3~46.5**, repeat **43.6~43.8**, prose **36.8~38.2 tok/s**.
+- **MTP Acceptance**: fib **87.9~88.4%**, json **86.7%**, code **81.8~85.0%**, repeat **70.0%**, prose **51.6~56.0%**.
+- **Agent Tool Calling (8/8 PASS)**: 1..8 tasks decode throughput **46.3~62.7 tok/s** (median **54.4 tok/s**).
 
 ## RDNA3 (GFX11) Auto-Defaults, MXFP4 F16 Fused Experts & Q4_0 Prompt Attention (fork) — 2026-11-13
 
