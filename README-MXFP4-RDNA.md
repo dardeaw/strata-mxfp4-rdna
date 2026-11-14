@@ -240,3 +240,24 @@ Starting in **v0.1.59**, the engine detects AMD GPU families by `gfx` prefix (`g
 | 131K | 119,643 | **1,182.9** | 101.23 s |
 
 Decode medians (`--spec 4 --short-read 64 --mtp-q4 head`): `short 37.50`, `prose 37.80`, `code 59.70`, `json 62.40`, `repeat 79.20`, `fib 63.30 tok/s`.
+
+
+## Agent & Tool Benchmarking: Twin Suites ("雙壁")
+
+This repository provides two complementary tool/agent benchmark suites for validating OpenAI-compatible endpoints under long context and functional tool calling:
+
+1. **Tools Ladder (`tools/tools_ladder.py` / `tools_ladder.py`)**:
+   - Evaluates whether quantized models maintain tool-calling competence across deep multi-turn KV cache history.
+   - Stacks assistant `tool_calls` and tool execution records across depth rungs (`--levels 400,1600,6400,18000`), demanding an exact final recovery call (`finish` with `{"value": "RECOVERED"}`).
+   - Run:
+     ```bash
+     python tools/tools_ladder.py --base-url http://127.0.0.1:8081/v1 --model <id> --key strata67
+     ```
+
+2. **8-Task ReAct Agent Suite (`tools/tools_react.py` / `tools_react.py`)**:
+   - Evaluates tool selection, schema validation, and decoding throughput across 8 functional domains: `weather`, `email`, `search`, `calc`, `translate`, `read_file`, `run_command`, `summarize`.
+   - Runs deterministic zero-temperature calls and verifies both the tool target and structured JSON arguments.
+   - Run:
+     ```bash
+     python tools/tools_react.py --base-url http://127.0.0.1:8081/v1 --model <id> --key strata67
+     ```
