@@ -37,3 +37,22 @@ MTP acceptance: fib 150/174 (86%), code 90/106 (85%)
 - file: strata-jamesrogers-mxfp4-7800xt.json
 - user_args: ["--kv-resident", "20480"]
 - env adds: STRATA_GDN_CHUNKED=0 (explicit off)
+
+## 5. wait copy deep-dive (2026-11-14, later) — NOT bandwidth, NOT stager
+Confirmed the 4.45s @19.6K is a structural staging-sync stall, not fixable by tuning:
+- PCIe pinned H2D measured 26.3 GB/s; NVMe direct 1.9 GB/s; ring drain ~0.01s. Bandwidth is fine.
+- Stager profile sweep (STRATA_STAGER_THREADS=32 + RING=128 + BATCH=8, the SSD-profile
+  that helps GGUF-from-SSD): on a 14.4K unique prompt gave 1423/1425 tok/s vs baseline
+  1372/1446 -> within noise, NO gain. Reverted (removed from config env).
+- adaptive overlap is OFF in resident-RAM mode unless STRATA_ADAPT_OVERLAP_RESIDENT=1;
+  enabling it earlier also showed no change to wait copy.
+Conclusion: wait copy is the compute stream waiting on expert-blob DMA completion events
+(prefill.cpp flush/wait_copied), gated by dependency + ring depth, not by link speed.
+Reducing it needs an engine-side staging redesign (route-aware prefetch / deeper coalesced
+ring), which competes with the already-tight VRAM. Not a flag-level win.
+
+## 6. gemm gate/up (20.7%) is hardware-gated, not tunable
+The fast MXFP4 W4A8 path needs FP8 (E4M3) WMMA = RDNA4/gfx12 only (prefill.cpp fp8_wmma_device()
+returns false for gfx110x). On RDNA3 the FP8 GEMMs cannot launch, so gate/up runs the FP16
+expert path. All available switches (PF_FUSED_MXFP4/PF_GEMM/PF_PAD/PF_F16) are already on.
+This is why the 9070 (RDNA4) beats the 7800XT here; not recoverable via config.
