@@ -1,5 +1,37 @@
 # Changelog
 
+## RDNA3 (GFX1101 / RX 7800 XT) Tuning, MBufo Tools Ladder & 8-Task ReAct Suite (fork) — 2026-11-14
+
+Version 0.1.60.
+
+### RDNA3 / RX 7800 XT Production Optimization
+- **KV-Resident Clamp Fix & Memory Staging**:
+  - Identified and fixed `vram_fit.fit_start()` downward walking bug that silently clamped `--kv-resident` from `20480` to `4096` when estimating tight VRAM.
+  - Adding `"user_args": ["--kv-resident", "20480"]` marks `kv_fixed=True`, exempting production config from the walk.
+  - Result: KV streaming VRAM overflow messages eliminated (99.6%+ block reads hit VRAM), decoding speed restored to **35–39.6 tok/s** (prose) and **45–52.5 tok/s** (fib) with 86–92% MTP acceptance.
+- **7800XT Tuning Configuration (`configs/mxfp4-rdna-7800xt.json`)**:
+  - GFX1101 tuned production configuration: `resident-budget-gib: 59.5`, `STRATA_GDN_CHUNKED=0`, `STRATA_PREFILL_LEND_PCT=100`, `STRATA_PREFILL_RING=288`.
+  - Thorough structural analysis of expert staging pipeline: pinned PCIe H2D delivers 26.3 GB/s, NVMe direct delivers 1.9 GB/s, ring drain completes in 0.01 s.
+- **GFX11 Kernel Optimizations (`src/kernels/cuda/qsa_prompt_attn.cu`)**:
+  - 16-byte V fast-path for GFX11 (using dual uint64 aligned loads).
+  - Explicit RDNA4 V-loop v8 fast-path guards restricting to `PA_KL==8` (GFX12 only).
+
+### Agent Benchmarking Twin Suites ("雙壁")
+- **MBufo-Style Tools Ladder (`tools/tools_ladder.py` / `tools_ladder.py`)**:
+  - Faithful reimplementation of MBufo's `concbench/tool_ladder.py` architecture.
+  - Tests tool-call degradation across geometric context lengths (`0 -> 500 -> 2,000 -> 8,000 -> 16,000 -> 32,000 -> 64,000 -> 128,000` tokens) with controlled filler text.
+  - Validates tool dispatch accuracy, detects failure modes (`no-call`, `text-json` markdown hallucination, schema mismatch), and breaks down pass rates by context depth rung and task domain.
+  - **RX 7800 XT Verified**: **24/24 PASS (100%)** across all context length rungs (0 to 128K).
+- **8-Task ReAct Agent Benchmark (`tools/tools_react.py` / `tools_react.py`)**:
+  - Evaluates 8 functional agent domains (`weather`, `email`, `search`, `calc`, `translate`, `read`, `shell`, `summary`) under deterministic `temperature=0` decoding.
+  - **RX 7800 XT Verified**: **8/8 PASS (100%)**, median decode **14.2 tok/s**.
+
+### Comprehensive RX 7800 XT (GFX1101, 16 GB, ROCm 7.2.4) Benchmarks
+- **Prefill Ladder**: 2K **351.2** (cold) | 4K **1,095.3** | 8K **1,497.2** | 16K **1,415.1** | 32K **1,669.3** | 65K **1,794.9** | 131K **1,668.4** | 250K **1,759.8 tok/s**.
+- **Needle in a Haystack**: 2K, 8K, 32K at 10%, 50%, 90% depths — **9 of 9 FOUND (100%)**.
+- **Decode**: prose **34.7–37.4**, fib **45.1–52.5**, code **43.2–55.3**, json **26.8–46.4 tok/s**.
+- **MTP Acceptance**: fib **92.2%** (153/166), code **81.1%** (90/111), json **88.6%** (39/44).
+
 ## RDNA3 (GFX11) Auto-Defaults, MXFP4 F16 Fused Experts & Q4_0 Prompt Attention (fork) — 2026-11-13
 
 Version 0.1.59.

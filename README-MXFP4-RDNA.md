@@ -241,6 +241,27 @@ Starting in **v0.1.59**, the engine detects AMD GPU families by `gfx` prefix (`g
 
 Decode medians (`--spec 4 --short-read 64 --mtp-q4 head`): `short 37.50`, `prose 37.80`, `code 59.70`, `json 62.40`, `repeat 79.20`, `fib 63.30 tok/s`.
 
+### RDNA3 Discrete GPU Results (AMD Radeon RX 7800 XT, `gfx1101`, 16 GB, ROCm 7.2.4)
+
+With `configs/mxfp4-rdna-7800xt.json` (`user_args: ["--kv-resident", "20480"]`, `--spec 4`, `--kv q4_0`):
+
+| Prompt Size | Tokens | Prefill (`tok/s`) | Wall Time |
+|---:|---:|---:|---:|
+| 2K | 1,759 | **351.2** (cold) | 5.0 s |
+| 4K | 4,251 | **1,095.3** | 3.9 s |
+| 8K | 8,062 | **1,497.2** | 5.4 s |
+| 16K | 16,610 | **1,415.1** | 11.7 s |
+| 32K | 31,855 | **1,669.3** | 19.1 s |
+| 65K | 65,552 | **1,794.9** | 36.5 s |
+| 131K | 132,893 | **1,668.4** | 79.7 s |
+| 250K | 253,411 | **1,759.8** | 144.0 s |
+
+- **Decode Throughput**: prose **34.7–37.4**, fib **45.1–52.5**, code **43.2–55.3**, json **26.8–46.4 tok/s**.
+- **MTP Acceptance**: fib **92.2%** (153/166), code **81.1%** (90/111), json **88.6%** (39/44).
+- **Needle in a Haystack**: 2K, 8K, 32K at 10%, 50%, 90% depths — **9 of 9 FOUND (100%)**.
+- **Tools Ladder (MBufo style, 0..128K context)**: **24/24 PASS (100%)**.
+- **ReAct 8-Task Benchmark**: **8/8 PASS (100%)**, median decode **14.2 tok/s**.
+
 
 ## Agent & Tool Benchmarking: Twin Suites ("雙壁")
 
