@@ -268,7 +268,7 @@ Measured under standard server timing protocol (`bench_protocol.py`, `timings.pr
 - **Tools Ladder (MBufo style, 0..128K context)**: **24 of 24 PASS (100%)**.
 
 
-## Agent & Tool Benchmarking: Twin Suites ("雙壁")
+## Agent & Tool Benchmarking: Twin Suites
 
 This repository provides two complementary tool/agent benchmark suites for validating OpenAI-compatible endpoints under long context and functional tool calling:
 

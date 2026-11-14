@@ -16,7 +16,7 @@ Version 0.1.60.
   - 16-byte V fast-path for GFX11 (using dual uint64 aligned loads).
   - Explicit RDNA4 V-loop v8 fast-path guards restricting to `PA_KL==8` (GFX12 only).
 
-### Agent Benchmarking Twin Suites ("雙壁")
+### Agent Benchmarking Twin Suites
 - **MBufo-Style Tools Ladder (`tools/tools_ladder.py` / `tools_ladder.py`)**:
   - Faithful reimplementation of MBufo's `concbench/tool_ladder.py` architecture.
   - Tests tool-call degradation across geometric context lengths (`0 -> 500 -> 2,000 -> 8,000 -> 16,000 -> 32,000 -> 64,000 -> 128,000` tokens) with controlled filler text.
